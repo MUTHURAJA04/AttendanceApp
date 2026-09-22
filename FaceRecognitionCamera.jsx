@@ -14,9 +14,11 @@ import {useTensorflowModel} from 'react-native-fast-tflite';
 const MODEL_INPUT_WIDTH = 112;
 const MODEL_INPUT_HEIGHT = 112;
 const EMBEDDING_SIZE = 128;
+const NORMALIZATION_EPSILON = 1e-12;
 
 export default function FaceRecognitionCamera() {
   const device = useCameraDevice('front');
+
   const {hasPermission, requestPermission} =
     useCameraPermission();
 
@@ -60,10 +62,9 @@ export default function FaceRecognitionCamera() {
   // Model:
   // [1, 3, 112, 112]
   //
-  // Therefore:
   // RGB
-  // float32
-  // planar = CHW
+  // Float32
+  // Planar / CHW
   // -----------------------------------------
 
   const {resizer, error: resizerError} =
@@ -172,7 +173,6 @@ export default function FaceRecognitionCamera() {
 
           // -----------------------------------
           // Run MobileFaceNet
-          // Supports both 1-input and 2-input models
           // -----------------------------------
 
           const modelInputs =
@@ -198,7 +198,7 @@ export default function FaceRecognitionCamera() {
             new Float32Array(outputs[0]);
 
           // -----------------------------------
-          // Verify output
+          // Verify output size
           // -----------------------------------
 
           if (
@@ -220,11 +220,10 @@ export default function FaceRecognitionCamera() {
             );
 
           // -----------------------------------
-          // Check values
+          // Validate raw embedding
           // -----------------------------------
 
           let allFinite = true;
-
           let sumSquares = 0;
 
           for (
@@ -242,11 +241,67 @@ export default function FaceRecognitionCamera() {
             sumSquares += value * value;
           }
 
-          const magnitude =
+          if (!allFinite) {
+            console.log(
+              'INVALID EMBEDDING: non-finite value',
+            );
+
+            return;
+          }
+
+          const rawMagnitude =
             Math.sqrt(sumSquares);
 
           // -----------------------------------
-          // Debug
+          // L2 NORMALIZATION
+          // -----------------------------------
+
+          const normalizedEmbedding =
+            new Float32Array(
+              EMBEDDING_SIZE,
+            );
+
+          const safeMagnitude =
+            Math.max(
+              rawMagnitude,
+              NORMALIZATION_EPSILON,
+            );
+
+          for (
+            let i = 0;
+            i < EMBEDDING_SIZE;
+            i++
+          ) {
+            normalizedEmbedding[i] =
+              embedding[i] /
+              safeMagnitude;
+          }
+
+          // -----------------------------------
+          // Verify normalized magnitude
+          // -----------------------------------
+
+          let normalizedSumSquares = 0;
+
+          for (
+            let i = 0;
+            i < normalizedEmbedding.length;
+            i++
+          ) {
+            const value =
+              normalizedEmbedding[i];
+
+            normalizedSumSquares +=
+              value * value;
+          }
+
+          const normalizedMagnitude =
+            Math.sqrt(
+              normalizedSumSquares,
+            );
+
+          // -----------------------------------
+          // DEBUG
           // -----------------------------------
 
           console.log(
@@ -274,40 +329,32 @@ export default function FaceRecognitionCamera() {
           );
 
           console.log(
-            'MAGNITUDE:',
-            magnitude,
+            'RAW MAGNITUDE:',
+            rawMagnitude,
           );
 
           console.log(
-            'FIRST 10:',
+            'NORMALIZED MAGNITUDE:',
+            normalizedMagnitude,
+          );
+
+          console.log(
+            'RAW FIRST 10:',
             Array.from(
               embedding.slice(0, 10),
             ),
           );
 
           console.log(
-            '====================================',
+            'NORMALIZED FIRST 10:',
+            Array.from(
+              normalizedEmbedding.slice(0, 10),
+            ),
           );
 
-          // -----------------------------------
-          // Send only small information back
-          // -----------------------------------
-          //
-          // We deliberately don't send the
-          // complete 128 values to React state
-          // on every frame.
-          //
-          // This test is only checking that
-          // real camera frames produce valid
-          // MobileFaceNet embeddings.
-          // -----------------------------------
-
-          if (
-            typeof globalThis !==
-            'undefined'
-          ) {
-            // Debug logging only.
-          }
+          console.log(
+            '====================================',
+          );
         } finally {
           resized.dispose();
         }
@@ -450,4 +497,3 @@ const styles = StyleSheet.create({
     marginTop: 10,
   },
 });
-
