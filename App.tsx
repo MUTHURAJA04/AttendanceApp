@@ -1,45 +1,73 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
+// import React, {useState} from 'react';
+// import {StyleSheet, Text, View} from 'react-native';
+// import FaceDetectionCamera from './FaceDetectionCamera';
 
-import { NewAppScreen } from '@react-native/new-app-screen';
-import { StatusBar, StyleSheet, useColorScheme, View } from 'react-native';
-import {
-  SafeAreaProvider,
-  useSafeAreaInsets,
-} from 'react-native-safe-area-context';
+// export default function App() {
+//   const [livenessVerified, setLivenessVerified] = useState(false);
 
-function App() {
-  const isDarkMode = useColorScheme() === 'dark';
+//   const handleLivenessVerified = () => {
+//     setLivenessVerified(true);
 
-  return (
-    <SafeAreaProvider>
-      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <AppContent />
-    </SafeAreaProvider>
-  );
+//     console.log('🎉 APP: LIVENESS VERIFIED');
+//   };
+
+//   return (
+//     <View style={styles.container}>
+//       <FaceDetectionCamera
+//         onLivenessVerified={handleLivenessVerified}
+//       />
+
+//       {livenessVerified && (
+//         <View style={styles.successBox}>
+//           <Text style={styles.successText}>
+//             Liveness Verified
+//           </Text>
+
+//           <Text style={styles.successSubText}>
+//             Ready for face verification
+//           </Text>
+//         </View>
+//       )}
+//     </View>
+//   );
+// }
+
+// const styles = StyleSheet.create({
+//   container: {
+//     flex: 1,
+//     backgroundColor: '#000',
+//   },
+
+//   successBox: {
+//     position: 'absolute',
+//     bottom: 50,
+//     left: 20,
+//     right: 20,
+//     paddingVertical: 18,
+//     paddingHorizontal: 20,
+//     borderRadius: 14,
+//     backgroundColor: '#166534',
+//     alignItems: 'center',
+//   },
+
+//   successText: {
+//     color: '#fff',
+//     fontSize: 20,
+//     fontWeight: '700',
+//   },
+
+//   successSubText: {
+//     color: '#dcfce7',
+//     fontSize: 14,
+//     marginTop: 5,
+//   },
+// });
+
+import React from 'react';
+import FaceModelTest from './FaceModelTest';
+import FaceRecognitionCamera from './FaceRecognitionCamera.jsx';
+
+export default function App() {
+  // return <FaceModelTest />;
+   return <FaceRecognitionCamera />;
 }
-
-function AppContent() {
-  const safeAreaInsets = useSafeAreaInsets();
-
-  return (
-    <View style={styles.container}>
-      <NewAppScreen
-        templateFileName="App.tsx"
-        safeAreaInsets={safeAreaInsets}
-      />
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-});
-
-export default App;

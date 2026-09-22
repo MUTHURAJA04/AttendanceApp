@@ -117,3 +117,37 @@ dependencies {
         implementation jscFlavor
     }
 }
+
+// Ensure Vulkan shader asset for react-native-vision-camera-resizer is compiled and packaged
+tasks.register("compileVulkanShaders") {
+    def shaderSource = file("${rootDir}/../node_modules/react-native-vision-camera-resizer/android/src/main/shaders/Resizer.comp")
+    def outputDir = file("${projectDir}/src/main/assets/shaders")
+    def outputFile = file("${outputDir}/Resizer.comp.spv")
+
+    inputs.file(shaderSource)
+    outputs.file(outputFile)
+
+    doLast {
+        if (!outputFile.exists() && shaderSource.exists()) {
+            outputDir.mkdirs()
+            def ndkDir = android.ndkDirectory
+            def glslc = file("${ndkDir}/shader-tools/windows-x86_64/glslc.exe")
+            if (!glslc.exists()) {
+                glslc = file("${ndkDir}/shader-tools/linux-x86_64/glslc")
+            }
+            if (!glslc.exists()) {
+                glslc = file("${ndkDir}/shader-tools/darwin-x86_64/glslc")
+            }
+            if (glslc.exists()) {
+                project.exec {
+                    commandLine glslc.absolutePath, "-O", shaderSource.absolutePath, "-o", outputFile.absolutePath
+                }
+            }
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn "compileVulkanShaders"
+}
+
