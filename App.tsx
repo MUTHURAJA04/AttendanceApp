@@ -64,10 +64,10 @@
 // });
 
 import React from 'react';
-import FaceModelTest from './FaceModelTest';
+import UnifiedAttendanceCamera from './UnifiedAttendanceCamera';
 import FaceRecognitionCamera from './FaceRecognitionCamera.jsx';
 
 export default function App() {
   // return <FaceModelTest />;
-   return <FaceRecognitionCamera />;
+   return <UnifiedAttendanceCamera/>
 }
