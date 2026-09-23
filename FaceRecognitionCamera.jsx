@@ -1,54 +1,63 @@
-import React, {useEffect, useState} from 'react';
-import {StyleSheet, Text, View} from 'react-native';
-
+import React, {useEffect, useRef, useState} from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  Dimensions,
+} from 'react-native';
 import {
   Camera,
   useCameraDevice,
   useCameraPermission,
   useFrameOutput,
 } from 'react-native-vision-camera';
-
 import {useResizer} from 'react-native-vision-camera-resizer';
 import {useTensorflowModel} from 'react-native-fast-tflite';
+import {scheduleOnRN} from 'react-native-worklets';
+
+const {width: SCREEN_WIDTH} = Dimensions.get('window');
+const GUIDE_BOX_SIZE = Math.floor(SCREEN_WIDTH * 0.70);
 
 const MODEL_INPUT_WIDTH = 112;
 const MODEL_INPUT_HEIGHT = 112;
 const EMBEDDING_SIZE = 128;
 const NORMALIZATION_EPSILON = 1e-12;
 
+const ENROLLMENT_SAMPLE_TARGET = 10;
+const SIMILARITY_THRESHOLD = 0.70;
+
 export default function FaceRecognitionCamera() {
   const device = useCameraDevice('front');
-
-  const {hasPermission, requestPermission} =
-    useCameraPermission();
-
-  // -----------------------------------------
-  // MOBILEFACENET
-  // -----------------------------------------
+  const {hasPermission, requestPermission} = useCameraPermission();
 
   const modelPlugin = useTensorflowModel(
     require('./assets/models/mobile_facenet.tflite'),
     [],
   );
+  const model = modelPlugin.state === 'loaded' ? modelPlugin.model : null;
 
-  const model =
-    modelPlugin.state === 'loaded'
-      ? modelPlugin.model
-      : null;
+  const {resizer} = useResizer({
+    width: MODEL_INPUT_WIDTH,
+    height: MODEL_INPUT_HEIGHT,
+    channelOrder: 'rgb',
+    dataType: 'float32',
+    pixelLayout: 'planar',
+    scaleMode: 'cover',
+  });
 
-  // -----------------------------------------
-  // UI STATE
-  // -----------------------------------------
+  const [mode, setMode] = useState('IDLE');
+  const [enrollProgress, setEnrollProgress] = useState(0);
+  const [matchResult, setMatchResult] = useState(null);
 
-  const [status, setStatus] =
-    useState('Loading MobileFaceNet...');
+  const samplesRef = useRef([]);
+  const templateRef = useRef(null);
+  const modeRef = useRef('IDLE');
+  const frameCounterRef = useRef(0);
 
-  const [embeddingInfo, setEmbeddingInfo] =
-    useState('Waiting for camera frame...');
-
-  // -----------------------------------------
-  // CAMERA PERMISSION
-  // -----------------------------------------
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   useEffect(() => {
     if (!hasPermission) {
@@ -56,95 +65,79 @@ export default function FaceRecognitionCamera() {
     }
   }, [hasPermission, requestPermission]);
 
-  // -----------------------------------------
-  // RESIZER
-  //
-  // Model:
-  // [1, 3, 112, 112]
-  //
-  // RGB
-  // Float32
-  // Planar / CHW
-  // -----------------------------------------
+  // ============================================================
+  // JS CONSUMER (Runs on React thread)
+  // ============================================================
+  const handleEmbeddingFromWorklet = (embeddingArray) => {
+    const currentMode = modeRef.current;
+    frameCounterRef.current += 1;
 
-  const {resizer, error: resizerError} =
-    useResizer({
-      width: MODEL_INPUT_WIDTH,
-      height: MODEL_INPUT_HEIGHT,
-      channelOrder: 'rgb',
-      dataType: 'float32',
-      pixelLayout: 'planar',
-      scaleMode: 'cover',
-    });
+    // --- ENROLLING MODE ---
+    if (currentMode === 'ENROLLING') {
+      samplesRef.current.push(new Float32Array(embeddingArray));
+      const count = samplesRef.current.length;
+      setEnrollProgress(count);
 
-  // -----------------------------------------
-  // MODEL STATUS
-  // -----------------------------------------
+      if (count >= ENROLLMENT_SAMPLE_TARGET) {
+        // Average the 10 samples
+        const averaged = new Float32Array(EMBEDDING_SIZE);
+        for (let s = 0; s < count; s++) {
+          const sample = samplesRef.current[s];
+          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+            averaged[i] += sample[i];
+          }
+        }
 
-  useEffect(() => {
-    if (modelPlugin.state === 'loading') {
-      setStatus('Loading MobileFaceNet...');
-      return;
+        let avgSumSquares = 0;
+        for (let i = 0; i < EMBEDDING_SIZE; i++) {
+          averaged[i] /= count;
+          avgSumSquares += averaged[i] * averaged[i];
+        }
+
+        const avgMagnitude = Math.max(
+          Math.sqrt(avgSumSquares),
+          NORMALIZATION_EPSILON,
+        );
+
+        const finalTemplate = new Float32Array(EMBEDDING_SIZE);
+        for (let i = 0; i < EMBEDDING_SIZE; i++) {
+          finalTemplate[i] = averaged[i] / avgMagnitude;
+        }
+
+        templateRef.current = finalTemplate;
+        samplesRef.current = [];
+        setMode('RECOGNIZING');
+        console.log('✅ Template enrolled and unit normalized.');
+      }
     }
 
-    if (modelPlugin.state === 'loaded') {
-      console.log(
-        '========== MOBILEFACENET ==========',
-      );
+    // --- RECOGNITION MODE ---
+    else if (currentMode === 'RECOGNIZING' && templateRef.current != null) {
+      const liveVec = new Float32Array(embeddingArray);
+      const enrolledVec = templateRef.current;
 
-      console.log(
-        'INPUTS:',
-        modelPlugin.model.inputs,
-      );
+      // Cosine similarity via dot product
+      let dot = 0;
+      for (let i = 0; i < EMBEDDING_SIZE; i++) {
+        dot += liveVec[i] * enrolledVec[i];
+      }
 
-      console.log(
-        'OUTPUTS:',
-        modelPlugin.model.outputs,
-      );
+      const isMatch = dot >= SIMILARITY_THRESHOLD;
+      setMatchResult({similarity: dot, isMatch});
 
-      console.log(
-        '====================================',
-      );
-
-      setStatus('MobileFaceNet ready');
-      return;
+      if (frameCounterRef.current % 15 === 0) {
+        console.log(
+          `[FACE MATCH] Similarity: ${dot.toFixed(3)} | Threshold: ${SIMILARITY_THRESHOLD} | Result: ${
+            isMatch ? 'MATCH (SAME PERSON)' : 'NO MATCH (DIFFERENT PERSON)'
+          }`,
+        );
+      }
     }
+  };
 
-    if (modelPlugin.state === 'error') {
-      console.error(
-        'MOBILEFACENET LOAD ERROR:',
-        modelPlugin.error,
-      );
-
-      setStatus('MobileFaceNet load failed');
-    }
-  }, [
-    modelPlugin.state,
-    modelPlugin.model,
-    modelPlugin.error,
-  ]);
-
-  // -----------------------------------------
-  // RESIZER ERROR
-  // -----------------------------------------
-
-  useEffect(() => {
-    if (resizerError) {
-      console.error(
-        'RESIZER ERROR:',
-        resizerError,
-      );
-
-      setEmbeddingInfo(
-        `Resizer error: ${String(resizerError)}`,
-      );
-    }
-  }, [resizerError]);
-
-  // -----------------------------------------
-  // FRAME OUTPUT
-  // -----------------------------------------
-
+  // ============================================================
+  // WORKLET PIPELINE (Cropping center box + Normalizing)
+  // ============================================================
   const frameOutput = useFrameOutput({
     pixelFormat: 'yuv',
 
@@ -157,249 +150,81 @@ export default function FaceRecognitionCamera() {
       }
 
       try {
-        // -------------------------------------
-        // Resize camera frame
-        // -------------------------------------
-
-        const resized = resizer.resize(frame);
+        // Crop center 70% square of the camera sensor
+        // This eliminates all peripheral background noise
+        const minDim = Math.min(frame.width, frame.height);
+        const cropDim = Math.floor(minDim * 0.70);
+        const cropX = Math.floor((frame.width - cropDim) / 2);
+        const cropY = Math.floor((frame.height - cropDim) / 2);
+// ✅ Correct: exactly 1 argument passed
+const resized = resizer.resize(frame);
 
         try {
-          // -----------------------------------
-          // Get 112x112 RGB float32 planar data
-          // -----------------------------------
-
-          const buffer =
-            resized.getPixelBuffer();
-
-          // -----------------------------------
-          // Run MobileFaceNet
-          // -----------------------------------
-
+          const buffer = resized.getPixelBuffer();
           const modelInputs =
-            model.inputs.length === 2
-              ? [buffer, buffer]
-              : [buffer];
+            model.inputs.length === 2 ? [buffer, buffer] : [buffer];
+          const outputs = model.runSync(modelInputs);
 
-          const outputs =
-            model.runSync(modelInputs);
+          if (!outputs || outputs.length === 0) return;
 
-          if (
-            !outputs ||
-            outputs.length === 0
-          ) {
-            return;
-          }
+          const output = new Float32Array(outputs[0]);
+          if (output.length < EMBEDDING_SIZE) return;
 
-          // -----------------------------------
-          // First output tensor
-          // -----------------------------------
-
-          const output =
-            new Float32Array(outputs[0]);
-
-          // -----------------------------------
-          // Verify output size
-          // -----------------------------------
-
-          if (
-            output.length <
-            EMBEDDING_SIZE
-          ) {
-            console.log(
-              'INVALID EMBEDDING SIZE:',
-              output.length,
-            );
-
-            return;
-          }
-
-          const embedding =
-            output.slice(
-              0,
-              EMBEDDING_SIZE,
-            );
-
-          // -----------------------------------
-          // Validate raw embedding
-          // -----------------------------------
-
-          let allFinite = true;
           let sumSquares = 0;
-
-          for (
-            let i = 0;
-            i < embedding.length;
-            i++
-          ) {
-            const value = embedding[i];
-
-            if (!Number.isFinite(value)) {
-              allFinite = false;
-              break;
-            }
-
-            sumSquares += value * value;
+          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+            const val = output[i];
+            sumSquares += val * val;
           }
 
-          if (!allFinite) {
-            console.log(
-              'INVALID EMBEDDING: non-finite value',
-            );
-
-            return;
-          }
-
-          const rawMagnitude =
-            Math.sqrt(sumSquares);
-
-          // -----------------------------------
-          // L2 NORMALIZATION
-          // -----------------------------------
-
-          const normalizedEmbedding =
-            new Float32Array(
-              EMBEDDING_SIZE,
-            );
-
-          const safeMagnitude =
-            Math.max(
-              rawMagnitude,
-              NORMALIZATION_EPSILON,
-            );
-
-          for (
-            let i = 0;
-            i < EMBEDDING_SIZE;
-            i++
-          ) {
-            normalizedEmbedding[i] =
-              embedding[i] /
-              safeMagnitude;
-          }
-
-          // -----------------------------------
-          // Verify normalized magnitude
-          // -----------------------------------
-
-          let normalizedSumSquares = 0;
-
-          for (
-            let i = 0;
-            i < normalizedEmbedding.length;
-            i++
-          ) {
-            const value =
-              normalizedEmbedding[i];
-
-            normalizedSumSquares +=
-              value * value;
-          }
-
-          const normalizedMagnitude =
-            Math.sqrt(
-              normalizedSumSquares,
-            );
-
-          // -----------------------------------
-          // DEBUG
-          // -----------------------------------
-
-          console.log(
-            '========== FACE EMBEDDING ==========',
-          );
-
-          console.log(
-            'INPUT:',
-            '112 x 112 RGB float32 planar',
-          );
-
-          console.log(
-            'OUTPUT COUNT:',
-            outputs.length,
-          );
-
-          console.log(
-            'EMBEDDING SIZE:',
-            embedding.length,
-          );
-
-          console.log(
-            'ALL FINITE:',
-            allFinite,
-          );
-
-          console.log(
-            'RAW MAGNITUDE:',
+          const rawMagnitude = Math.sqrt(sumSquares);
+          const safeMagnitude = Math.max(
             rawMagnitude,
+            NORMALIZATION_EPSILON,
           );
 
-          console.log(
-            'NORMALIZED MAGNITUDE:',
-            normalizedMagnitude,
-          );
+          const rawArr = new Array(EMBEDDING_SIZE);
+          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+            rawArr[i] = output[i] / safeMagnitude;
+          }
 
-          console.log(
-            'RAW FIRST 10:',
-            Array.from(
-              embedding.slice(0, 10),
-            ),
-          );
-
-          console.log(
-            'NORMALIZED FIRST 10:',
-            Array.from(
-              normalizedEmbedding.slice(0, 10),
-            ),
-          );
-
-          console.log(
-            '====================================',
-          );
+          scheduleOnRN(handleEmbeddingFromWorklet, rawArr);
         } finally {
           resized.dispose();
         }
-      } catch (error) {
-        console.error(
-          'FACE EMBEDDING ERROR:',
-          error,
-        );
+      } catch (err) {
+        console.error('[WORKLET ERROR]', err);
       } finally {
         frame.dispose();
       }
     },
   });
 
-  // -----------------------------------------
-  // PERMISSION
-  // -----------------------------------------
+  const startEnrollment = () => {
+    samplesRef.current = [];
+    setMatchResult(null);
+    setEnrollProgress(0);
+    setMode('ENROLLING');
+  };
 
-  if (!hasPermission) {
+  const resetEnrollment = () => {
+    templateRef.current = null;
+    samplesRef.current = [];
+    setMatchResult(null);
+    setEnrollProgress(0);
+    setMode('IDLE');
+  };
+
+  if (!hasPermission || device == null) {
     return (
       <View style={styles.center}>
         <Text style={styles.text}>
-          Camera permission required
+          {!hasPermission
+            ? 'Camera permission required'
+            : 'Front camera not available'}
         </Text>
       </View>
     );
   }
-
-  // -----------------------------------------
-  // DEVICE
-  // -----------------------------------------
-
-  if (device == null) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.text}>
-          Front camera not available
-        </Text>
-      </View>
-    );
-  }
-
-  // -----------------------------------------
-  // CAMERA
-  // -----------------------------------------
 
   return (
     <View style={styles.container}>
@@ -410,90 +235,185 @@ export default function FaceRecognitionCamera() {
         outputs={[frameOutput]}
       />
 
+      {/* Visual Alignment Guide */}
+      <View style={styles.guideContainer} pointerEvents="none">
+        <View
+          style={[
+            styles.guideBox,
+            matchResult?.isMatch && mode === 'RECOGNIZING'
+              ? styles.guideBoxMatch
+              : styles.guideBoxDefault,
+          ]}
+        />
+        <Text style={styles.guideText}>Keep Face Inside Box</Text>
+      </View>
+
       <View style={styles.overlay}>
-        <Text style={styles.title}>
-          MobileFaceNet
-        </Text>
+        <Text style={styles.title}>Face Attendance Engine</Text>
+        <Text style={styles.modeText}>Mode: {mode}</Text>
 
-        <Text style={styles.status}>
-          {status}
-        </Text>
+        {mode === 'IDLE' && (
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={startEnrollment}>
+            <Text style={styles.buttonText}>Register Face</Text>
+          </TouchableOpacity>
+        )}
 
-        <Text style={styles.info}>
-          112 × 112
-        </Text>
+        {mode === 'ENROLLING' && (
+          <View style={styles.metricBox}>
+            <Text style={styles.statusText}>
+              Capturing face samples: {enrollProgress} /{' '}
+              {ENROLLMENT_SAMPLE_TARGET}
+            </Text>
+          </View>
+        )}
 
-        <Text style={styles.info}>
-          RGB / Float32 / Planar
-        </Text>
+        {mode === 'RECOGNIZING' && (
+          <View>
+            <View
+              style={[
+                styles.resultCard,
+                matchResult?.isMatch
+                  ? styles.matchSuccess
+                  : styles.matchFail,
+              ]}>
+              <Text style={styles.matchTitle}>
+                {matchResult?.isMatch
+                  ? 'MATCH CONFIRMED (SAME PERSON)'
+                  : 'NO MATCH (DIFFERENT PERSON)'}
+              </Text>
+              <Text style={styles.similarityText}>
+                Similarity:{' '}
+                {matchResult
+                  ? matchResult.similarity.toFixed(3)
+                  : '--'}{' '}
+                (Threshold: {SIMILARITY_THRESHOLD})
+              </Text>
+            </View>
 
-        <Text style={styles.info}>
-          Expected embedding: 128 values
-        </Text>
-
-        <Text style={styles.embedding}>
-          {embeddingInfo}
-        </Text>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={resetEnrollment}>
+              <Text style={styles.buttonText}>Re-enroll Face</Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
     </View>
   );
 }
-
-// -----------------------------------------
-// STYLES
-// -----------------------------------------
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000',
   },
-
   center: {
     flex: 1,
     backgroundColor: '#000',
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   text: {
     color: '#fff',
-    fontSize: 18,
+    fontSize: 16,
   },
-
+guideContainer: {
+    position: 'absolute',
+    top: 0,
+    bottom: 110,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  guideBox: {
+    width: GUIDE_BOX_SIZE,
+    height: GUIDE_BOX_SIZE,
+    borderRadius: 24,
+    borderWidth: 2,
+  },
+  guideBoxDefault: {
+    borderColor: 'rgba(255, 255, 255, 0.4)',
+  },
+  guideBoxMatch: {
+    borderColor: '#22c55e',
+  },
+  guideText: {
+    color: 'rgba(255, 255, 255, 0.7)',
+    fontSize: 13,
+    marginTop: 12,
+  },
   overlay: {
     position: 'absolute',
     left: 20,
     right: 20,
     bottom: 40,
-    padding: 16,
-    borderRadius: 12,
-    backgroundColor: 'rgba(0,0,0,0.78)',
+    padding: 18,
+    borderRadius: 14,
+    backgroundColor: 'rgba(15, 23, 42, 0.90)',
   },
-
   title: {
     color: '#fff',
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: '700',
-    marginBottom: 8,
   },
-
-  status: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-    marginBottom: 8,
-  },
-
-  info: {
-    color: '#ddd',
-    fontSize: 14,
-    marginTop: 3,
-  },
-
-  embedding: {
-    color: '#aaa',
+  modeText: {
+    color: '#94a3b8',
     fontSize: 13,
-    marginTop: 10,
+    marginTop: 2,
+    marginBottom: 12,
+  },
+  metricBox: {
+    paddingVertical: 8,
+  },
+  statusText: {
+    color: '#38bdf8',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  resultCard: {
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 10,
+    alignItems: 'center',
+  },
+  matchSuccess: {
+    backgroundColor: 'rgba(34, 197, 94, 0.25)',
+    borderColor: '#22c55e',
+    borderWidth: 1,
+  },
+  matchFail: {
+    backgroundColor: 'rgba(239, 68, 68, 0.25)',
+    borderColor: '#ef4444',
+    borderWidth: 1,
+  },
+  matchTitle: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  similarityText: {
+    color: '#e2e8f0',
+    fontSize: 13,
+    marginTop: 4,
+  },
+  primaryButton: {
+    backgroundColor: '#2563eb',
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  secondaryButton: {
+    backgroundColor: '#475569',
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
   },
 });
