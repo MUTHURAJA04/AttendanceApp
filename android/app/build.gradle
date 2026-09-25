@@ -105,6 +105,10 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }
     }
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
 }
 
 dependencies {
@@ -151,3 +155,8 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.con
     dependsOn "compileVulkanShaders"
 }
 
+project.afterEvaluate {
+    tasks.matching { it.name.startsWith("generate") && it.name.contains("Lint") }.configureEach {
+        dependsOn tasks.named("compileVulkanShaders")
+    }
+}

@@ -45,21 +45,64 @@ export const EmployeeStorage = {
   },
 
   // Log attendance punch
+// Replace logAttendancePunch in EmployeeStorage:
   async logAttendancePunch({employeeId, employeeName, similarityScore}) {
     try {
       const logs = await this.getAttendanceLogs();
+      const now = new Date();
+      const todayDateStr = now.toDateString();
+
+      // Find all punches today for this specific employee
+      const todayPunches = logs.filter(
+        (log) =>
+          log.employeeId === employeeId &&
+          new Date(log.timestamp).toDateString() === todayDateStr,
+      );
+
+      // --- 1. DUPLICATE PUNCH RULE (2-Minute Cooldown) ---
+      if (todayPunches.length > 0) {
+        const lastPunch = todayPunches[0]; // Most recent punch
+        const diffMs = now.getTime() - new Date(lastPunch.timestamp).getTime();
+        const diffMinutes = diffMs / (1000 * 60);
+
+        if (diffMinutes < 2) {
+          const waitSeconds = Math.ceil((2 * 60 * 1000 - diffMs) / 1000);
+          return {
+            status: 'DUPLICATE_BLOCKED',
+            waitSeconds,
+            lastType: lastPunch.type,
+            employeeName,
+          };
+        }
+      }
+
+      // --- 2. SHIFT IN / OUT LOGIC ---
+      // If no punch today -> 'IN'
+      // If last punch was 'IN' -> 'OUT'
+      // If last punch was 'OUT' -> 'IN'
+      let punchType = 'IN';
+      if (todayPunches.length > 0) {
+        punchType = todayPunches[0].type === 'IN' ? 'OUT' : 'IN';
+      }
+
       const newPunch = {
         id: Date.now().toString(),
         employeeId,
         employeeName,
-        timestamp: new Date().toISOString(),
+        timestamp: now.toISOString(),
         score: similarityScore,
+        type: punchType,
       };
+
       logs.unshift(newPunch);
-      await AsyncStorage.setItem(ATTENDANCE_LOGS_KEY, JSON.stringify(logs.slice(0, 100))); // keep last 100
-      return newPunch;
+      await AsyncStorage.setItem(ATTENDANCE_LOGS_KEY, JSON.stringify(logs.slice(0, 300)));
+      return {
+        status: 'SUCCESS',
+        punch: newPunch,
+      };
     } catch (e) {
-      console.error('Failed to log attendance', e);
+      console.error('Failed to log punch', e);
+      return { status: 'ERROR' };
     }
   },
 
@@ -75,5 +118,26 @@ export const EmployeeStorage = {
   async clearAll() {
     await AsyncStorage.removeItem(EMPLOYEES_KEY);
     await AsyncStorage.removeItem(ATTENDANCE_LOGS_KEY);
+  }
+};
+
+
+export const ConfigStorage = {
+  async getConfig() {
+    try {
+      const [threshold, liveness] = await Promise.all([
+        AsyncStorage.getItem('@config_threshold'),
+        AsyncStorage.getItem('@config_liveness'),
+      ]);
+      return {
+        threshold: threshold ? parseFloat(threshold) : 0.70,
+        liveness: liveness !== null ? liveness === 'true' : true,
+      };
+    } catch {
+      return { threshold: 0.70, liveness: true };
+    }
+  },
+  async setConfig(key, value) {
+    await AsyncStorage.setItem(key, String(value));
   }
 };
