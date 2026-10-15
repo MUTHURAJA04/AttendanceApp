@@ -1,12 +1,8 @@
-import React, {useState, useRef, useEffect, useCallback} from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   StyleSheet,
-  Text,
   View,
   Modal,
-  TouchableOpacity,
-  Dimensions,
-  ActivityIndicator,
   Alert,
 } from 'react-native';
 import {
@@ -14,21 +10,15 @@ import {
   useCameraPermission,
   useFrameOutput,
 } from 'react-native-vision-camera';
-import {Camera} from 'react-native-vision-camera-face-detector';
-import {useResizer} from 'react-native-vision-camera-resizer';
-import {useTensorflowModel} from 'react-native-fast-tflite';
-import {scheduleOnRN} from 'react-native-worklets';
-import {supabase} from '../services/supabase';
-
-const {width: SCREEN_WIDTH} = Dimensions.get('window');
-const GUIDE_BOX_SIZE = Math.floor(SCREEN_WIDTH * 0.7);
-
-const MODEL_INPUT_WIDTH = 112;
-const MODEL_INPUT_HEIGHT = 112;
-const EMBEDDING_SIZE = 128;
-const NORMALIZATION_EPSILON = 1e-12;
-const ENROLLMENT_SAMPLE_TARGET = 10;
-const SAMPLE_INTERVAL_MS = 250; // Capture 1 sample every 250ms for angle variation
+import { Camera } from 'react-native-vision-camera-face-detector';
+import { useResizer } from 'react-native-vision-camera-resizer';
+import { useTensorflowModel } from 'react-native-fast-tflite';
+import { scheduleOnRN } from 'react-native-worklets';
+import { EmployeeStorage, ConfigStorage } from '../services/employeeStorage';
+import { FACE_CONFIG } from '../constants/faceConfig';
+import { averageEmbeddings, validateFacePose } from '../utils/faceEmbeddingUtils';
+import FaceGuideBox from '../components/FaceGuideBox';
+import EnrollmentProgressCard from '../components/EnrollmentProgressCard';
 
 export default function RegisterFaceModal({
   visible,
@@ -37,7 +27,7 @@ export default function RegisterFaceModal({
   onEnrolled,
 }) {
   const device = useCameraDevice('front');
-  const {hasPermission} = useCameraPermission();
+  const { hasPermission, requestPermission } = useCameraPermission();
 
   const modelPlugin = useTensorflowModel(
     require('../assets/models/mobile_facenet.tflite'),
@@ -45,9 +35,9 @@ export default function RegisterFaceModal({
   );
   const model = modelPlugin.state === 'loaded' ? modelPlugin.model : null;
 
-  const {resizer} = useResizer({
-    width: MODEL_INPUT_WIDTH,
-    height: MODEL_INPUT_HEIGHT,
+  const { resizer } = useResizer({
+    width: FACE_CONFIG.MODEL_INPUT_WIDTH,
+    height: FACE_CONFIG.MODEL_INPUT_HEIGHT,
     channelOrder: 'rgb',
     dataType: 'float32',
     pixelLayout: 'planar',
@@ -55,9 +45,16 @@ export default function RegisterFaceModal({
   });
 
   const [samplesCount, setSamplesCount] = useState(0);
+  const [targetSamples, setTargetSamples] = useState(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET);
   const [detectionStatus, setDetectionStatus] = useState('Position Face in Box');
+  const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'WARNING' | 'MATCH'
   const [hasValidFace, setHasValidFace] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+
+  // Dynamic configuration refs from DB
+  const targetSamplesRef = useRef(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET);
+  const sampleIntervalMsRef = useRef(FACE_CONFIG.SAMPLE_INTERVAL_MS);
+  const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES);
 
   const samplesRef = useRef([]);
   const isCapturingRef = useRef(true);
@@ -65,9 +62,28 @@ export default function RegisterFaceModal({
   const lastSampleTimeRef = useRef(0);
 
   useEffect(() => {
+    if (!hasPermission) {
+      requestPermission();
+    }
+  }, [hasPermission, requestPermission]);
+
+  // Load latest dynamic settings from DB
+  useEffect(() => {
     if (visible) {
+      ConfigStorage.getConfig().then((cfg) => {
+        const samples = cfg.enrollmentSamples || FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET;
+        const interval = cfg.sampleIntervalMs || FACE_CONFIG.SAMPLE_INTERVAL_MS;
+        const yaw = cfg.yawAngleTolerance || FACE_CONFIG.MAX_HEAD_YAW_DEGREES;
+
+        setTargetSamples(samples);
+        targetSamplesRef.current = samples;
+        sampleIntervalMsRef.current = interval;
+        yawAngleToleranceRef.current = yaw;
+      });
+
       setSamplesCount(0);
       setDetectionStatus('Position Face in Box');
+      setBoxState('DEFAULT');
       setHasValidFace(false);
       setIsSaving(false);
       samplesRef.current = [];
@@ -78,38 +94,34 @@ export default function RegisterFaceModal({
   }, [visible]);
 
   // ============================================================
-  // SAVE EMBEDDING DIRECTLY TO SUPABASE
+  // SAVE EMBEDDING LOCALLY & TO CLOUD
   // ============================================================
-  const saveEmbeddingToDb = async (vectorArray) => {
+  const handleSaveEnrollment = async (templateVector) => {
     if (!employee?.id) {
-      Alert.alert('Error', 'No employee specified for enrollment.');
+      Alert.alert('Error', 'No employee profile selected for enrollment.');
       onClose();
       return;
     }
 
     try {
       setIsSaving(true);
-      console.log(`[Supabase] Saving face embedding for ${employee.name || employee.full_name}...`);
+      console.log(`[RegisterFaceModal] Saving face embedding locally and to cloud for ${employee.name || employee.full_name}...`);
 
-      const {error} = await supabase
-        .from('employees')
-        .update({
-          face_embedding: vectorArray,
-          face_updated_at: new Date().toISOString(),
-        })
-        .eq('id', employee.id);
+      // Saves locally to AsyncStorage AND syncs to Supabase
+      await EmployeeStorage.saveEmployeeFaceCloudAndLocal({
+        employee,
+        template: templateVector,
+      });
 
-      if (error) {
-        throw error;
-      }
+      setBoxState('MATCH');
+      setDetectionStatus('Face Enrolled & Saved Locally!');
 
-      console.log('[Supabase] Face embedding successfully saved!');
       Alert.alert(
-        'Success! ✓',
-        `Face profile registered for ${employee.name || employee.full_name || 'employee'}!`,
+        'Enrollment Complete! ✓',
+        `Face template saved locally on device and synced for ${employee.name || employee.full_name || 'employee'}.`,
         [
           {
-            text: 'OK',
+            text: 'Done',
             onPress: () => {
               onEnrolled?.();
             },
@@ -117,13 +129,14 @@ export default function RegisterFaceModal({
         ],
       );
     } catch (err) {
-      console.error('[Supabase Save Error]:', err);
-      Alert.alert('Save Failed', err.message || 'Could not update face in database.');
-      // Re-enable scanning on failure
+      console.error('[RegisterFaceModal Save Error]:', err);
+      Alert.alert('Save Error', err.message || 'Failed to save embedding.');
+      // Re-enable scanning
       isCapturingRef.current = true;
       samplesRef.current = [];
       setSamplesCount(0);
       setIsSaving(false);
+      setBoxState('DEFAULT');
     }
   };
 
@@ -137,45 +150,31 @@ export default function RegisterFaceModal({
       return;
     }
 
-    if (!Array.isArray(faces) || faces.length === 0) {
+    const validation = validateFacePose(faces, yawAngleToleranceRef.current);
+
+    if (!validation.isValid) {
       hasValidFaceRef.current = false;
       setHasValidFace(false);
-      setDetectionStatus('No Face Detected');
-      return;
-    }
-
-    if (faces.length > 1) {
-      hasValidFaceRef.current = false;
-      setHasValidFace(false);
-      setDetectionStatus('Multiple Faces: Only 1 person in frame');
-      return;
-    }
-
-    const face = faces[0];
-    const yaw = typeof face.yawAngle === 'number' ? face.yawAngle : 0;
-
-    if (Math.abs(yaw) > 18) {
-      hasValidFaceRef.current = false;
-      setHasValidFace(false);
-      setDetectionStatus('Look directly at camera');
+      setBoxState(validation.status === 'NO_FACE' ? 'DEFAULT' : 'WARNING');
+      setDetectionStatus(validation.message);
       return;
     }
 
     // Valid single face detected
     hasValidFaceRef.current = true;
     setHasValidFace(true);
-    setDetectionStatus('Face Detected - Hold Still...');
+    setBoxState('ALIGNED');
+    setDetectionStatus('Face Aligned - Hold Steady...');
   }, []);
 
   // ============================================================
   // WORKLET RECEIVER & VECTOR AVERAGING
   // ============================================================
   const handleEmbeddingFromWorklet = (rawArr) => {
-    if (!isCapturingRef.current) return;
-    if (!hasValidFaceRef.current) return;
+    if (!isCapturingRef.current || !hasValidFaceRef.current) return;
 
     const now = Date.now();
-    if (now - lastSampleTimeRef.current < SAMPLE_INTERVAL_MS) {
+    if (now - lastSampleTimeRef.current < sampleIntervalMsRef.current) {
       return;
     }
     lastSampleTimeRef.current = now;
@@ -184,33 +183,17 @@ export default function RegisterFaceModal({
     const count = samplesRef.current.length;
     setSamplesCount(count);
 
-    if (count >= ENROLLMENT_SAMPLE_TARGET) {
+    if (count >= targetSamplesRef.current) {
       isCapturingRef.current = false;
       hasValidFaceRef.current = false;
 
-      // Element-wise averaging of the 10 verified face samples
-      const averaged = new Float32Array(EMBEDDING_SIZE);
-      for (let s = 0; s < count; s++) {
-        const sample = samplesRef.current[s];
-        for (let i = 0; i < EMBEDDING_SIZE; i++) {
-          averaged[i] += sample[i];
-        }
-      }
+      // Element-wise averaging and unit normalization
+      const finalTemplate = averageEmbeddings(
+        samplesRef.current,
+        FACE_CONFIG.EMBEDDING_SIZE,
+      );
 
-      let avgSumSquares = 0;
-      for (let i = 0; i < EMBEDDING_SIZE; i++) {
-        averaged[i] /= count;
-        avgSumSquares += averaged[i] * averaged[i];
-      }
-
-      const avgMagnitude = Math.max(Math.sqrt(avgSumSquares), NORMALIZATION_EPSILON);
-      const finalTemplate = new Array(EMBEDDING_SIZE);
-      for (let i = 0; i < EMBEDDING_SIZE; i++) {
-        finalTemplate[i] = Number((averaged[i] / avgMagnitude).toFixed(6));
-      }
-
-      // Automatically push to Supabase
-      saveEmbeddingToDb(finalTemplate);
+      handleSaveEnrollment(finalTemplate);
     }
   };
 
@@ -235,18 +218,18 @@ export default function RegisterFaceModal({
           if (!outputs || outputs.length === 0) return;
 
           const output = new Float32Array(outputs[0]);
-          if (output.length < EMBEDDING_SIZE) return;
+          if (output.length < FACE_CONFIG.EMBEDDING_SIZE) return;
 
           let sumSquares = 0;
-          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+          for (let i = 0; i < FACE_CONFIG.EMBEDDING_SIZE; i++) {
             sumSquares += output[i] * output[i];
           }
 
           const rawMagnitude = Math.sqrt(sumSquares);
-          const safeMagnitude = Math.max(rawMagnitude, NORMALIZATION_EPSILON);
+          const safeMagnitude = Math.max(rawMagnitude, FACE_CONFIG.NORMALIZATION_EPSILON);
 
-          const rawArr = new Array(EMBEDDING_SIZE);
-          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+          const rawArr = new Array(FACE_CONFIG.EMBEDDING_SIZE);
+          for (let i = 0; i < FACE_CONFIG.EMBEDDING_SIZE; i++) {
             rawArr[i] = output[i] / safeMagnitude;
           }
 
@@ -282,62 +265,22 @@ export default function RegisterFaceModal({
           />
         )}
 
-        {/* Perfectly Centered Guide Frame */}
-        <View style={styles.guideWrapper} pointerEvents="none">
-          <View
-            style={[
-              styles.guideBox,
-              hasValidFace ? styles.guideBoxActive : styles.guideBoxWaiting,
-            ]}
-          />
-          <Text
-            style={[
-              styles.scanPrompt,
-              hasValidFace ? styles.promptActive : styles.promptWaiting,
-            ]}>
-            {isSaving ? 'Processing & Saving...' : detectionStatus}
-          </Text>
-        </View>
+        {/* Reusable Guide Frame Overlay */}
+        <FaceGuideBox
+          boxState={boxState}
+          promptText={isSaving ? 'Saving Face Template...' : detectionStatus}
+          subText={`Look straight into camera to capture ${targetSamples} verified angles`}
+          isIdentified={hasValidFace}
+        />
 
-        {/* Bottom Progress Card */}
-        <View style={styles.progressCard}>
-          <Text style={styles.progressTitle}>
-            Enrolling: {employee?.name || employee?.full_name || 'Staff Member'}
-          </Text>
-
-          {isSaving ? (
-            <View style={styles.savingRow}>
-              <ActivityIndicator color="#38bdf8" size="small" />
-              <Text style={styles.savingText}>Updating database...</Text>
-            </View>
-          ) : (
-            <>
-              <Text style={styles.progressCount}>
-                Verified Samples: {samplesCount} / {ENROLLMENT_SAMPLE_TARGET}
-              </Text>
-
-              <View style={styles.progressBarTrack}>
-                <View
-                  style={[
-                    styles.progressBarFill,
-                    {
-                      width: `${
-                        (samplesCount / ENROLLMENT_SAMPLE_TARGET) * 100
-                      }%`,
-                    },
-                  ]}
-                />
-              </View>
-            </>
-          )}
-
-          <TouchableOpacity
-            style={styles.cancelBtn}
-            onPress={onClose}
-            disabled={isSaving}>
-            <Text style={styles.cancelBtnText}>Cancel</Text>
-          </TouchableOpacity>
-        </View>
+        {/* Reusable Bottom Progress Card */}
+        <EnrollmentProgressCard
+          employeeName={employee?.name || employee?.full_name}
+          samplesCount={samplesCount}
+          targetSamples={targetSamples}
+          isSaving={isSaving}
+          onCancel={onClose}
+        />
       </View>
     </Modal>
   );
@@ -347,96 +290,5 @@ const styles = StyleSheet.create({
   modalContainer: {
     flex: 1,
     backgroundColor: '#000000',
-  },
-  guideWrapper: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  guideBox: {
-    width: GUIDE_BOX_SIZE,
-    height: GUIDE_BOX_SIZE,
-    borderRadius: 28,
-    borderWidth: 2.5,
-  },
-  guideBoxWaiting: {
-    borderColor: 'rgba(255, 255, 255, 0.5)',
-  },
-  guideBoxActive: {
-    borderColor: '#22c55e',
-    borderWidth: 3.5,
-  },
-  scanPrompt: {
-    fontSize: 14,
-    marginTop: 16,
-    fontWeight: '700',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    overflow: 'hidden',
-  },
-  promptWaiting: {
-    color: '#cbd5e1',
-    backgroundColor: 'rgba(15, 23, 42, 0.85)',
-  },
-  promptActive: {
-    color: '#22c55e',
-    backgroundColor: 'rgba(22, 101, 52, 0.85)',
-  },
-  progressCard: {
-    position: 'absolute',
-    bottom: 40,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(15, 23, 42, 0.92)',
-    padding: 18,
-    borderRadius: 16,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  progressTitle: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  progressCount: {
-    color: '#38bdf8',
-    fontSize: 13,
-    fontWeight: '600',
-    marginTop: 6,
-  },
-  progressBarTrack: {
-    width: '100%',
-    height: 6,
-    backgroundColor: '#1e293b',
-    borderRadius: 3,
-    marginTop: 12,
-    overflow: 'hidden',
-  },
-  progressBarFill: {
-    height: '100%',
-    backgroundColor: '#38bdf8',
-  },
-  savingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginTop: 10,
-  },
-  savingText: {
-    color: '#38bdf8',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  cancelBtn: {
-    marginTop: 14,
-    paddingVertical: 6,
-    paddingHorizontal: 16,
-  },
-  cancelBtnText: {
-    color: '#ef4444',
-    fontSize: 14,
-    fontWeight: '600',
   },
 });

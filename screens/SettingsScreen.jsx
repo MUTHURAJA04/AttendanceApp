@@ -1,151 +1,261 @@
-import React, {useState, useEffect} from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   StyleSheet,
   Text,
   View,
   TouchableOpacity,
-  Switch,
   Alert,
   ScrollView,
+  ActivityIndicator,
+  Platform,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import {EmployeeStorage} from '../services/employeeStorage';
+import { useIsFocused } from '@react-navigation/native';
+import { EmployeeStorage } from '../services/employeeStorage';
+import {
+  loadKioskSettings,
+  subscribeToLiveSettings,
+} from '../services/kioskSettings';
+import { FACE_CONFIG } from '../constants/faceConfig';
 
-export default function SettingsScreen({navigation}) {
-  const [similarityThreshold, setSimilarityThreshold] = useState('0.70');
-  const [livenessEnabled, setLivenessEnabled] = useState(true);
+export default function SettingsScreen() {
+  const isFocused = useIsFocused();
+  const [config, setConfig] = useState({
+    antiSpoofing: true,
+    requireBlink: true,
+    similarityThreshold: FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD,
+    yawTolerance: FACE_CONFIG.MAX_HEAD_YAW_DEGREES,
+    doublePunchLockout: FACE_CONFIG.PUNCH_COOLDOWN_MINUTES,
+    enrollmentSamples: FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET,
+    sampleIntervalMs: FACE_CONFIG.SAMPLE_INTERVAL_MS,
+    sessionVersion: 1,
+  });
   const [totalEnrolled, setTotalEnrolled] = useState(0);
+  const [totalEmployees, setTotalEmployees] = useState(0);
+  const [lastSynced, setLastSynced] = useState(null);
+  const [isSyncing, setIsSyncing] = useState(false);
 
-  useEffect(() => {
-    loadSettings();
+  const loadSettingsAndDiagnostics = useCallback(async () => {
+    try {
+      // 1. Auto-fetch live biometric settings from DB
+      const liveSettings = await loadKioskSettings();
+      setConfig(liveSettings);
+
+      // 2. Load local employee directory counts
+      const allEmps = await EmployeeStorage.getAllEmployees();
+      const enrolledEmps = allEmps.filter((e) => e.hasFace && e.template);
+
+      setTotalEmployees(allEmps.length);
+      setTotalEnrolled(enrolledEmps.length);
+
+      // 3. Load last employee sync timestamp
+      const syncTime = await EmployeeStorage.getLastSyncedTime();
+      setLastSynced(syncTime);
+    } catch (e) {
+      console.error('[Settings] Load diagnostics error:', e);
+    }
   }, []);
 
-  const loadSettings = async () => {
+  useEffect(() => {
+    if (isFocused) {
+      loadSettingsAndDiagnostics();
+
+      // Subscribe to real-time database changes for configuration so it always reflects live
+      const liveSub = subscribeToLiveSettings((updated) => {
+        console.log('[SettingsScreen] Live settings update received from DB:', updated);
+        setConfig(updated);
+      });
+
+      return () => {
+        if (liveSub?.unsubscribe) liveSub.unsubscribe();
+      };
+    }
+  }, [isFocused, loadSettingsAndDiagnostics]);
+
+  // Sync button specifically handles Employee & Face Embedding data synchronization
+  const handleSyncEmployees = async () => {
     try {
-      const savedThreshold = await AsyncStorage.getItem('@config_threshold');
-      if (savedThreshold) setSimilarityThreshold(savedThreshold);
+      setIsSyncing(true);
 
-      const savedLiveness = await AsyncStorage.getItem('@config_liveness');
-      if (savedLiveness !== null) setLivenessEnabled(savedLiveness === 'true');
+      const syncedEmployees = await EmployeeStorage.syncEmployeesFromCloud();
+      const enrolled = syncedEmployees.filter((e) => e.hasFace && e.template);
 
-      const emps = await EmployeeStorage.getAllEmployees();
-      setTotalEnrolled(emps.length);
-    } catch (e) {
-      console.error(e);
+      setTotalEmployees(syncedEmployees.length);
+      setTotalEnrolled(enrolled.length);
+
+      const nowIso = new Date().toISOString();
+      setLastSynced(nowIso);
+
+      Alert.alert(
+        'Employee Sync Complete! ✓',
+        `Successfully synchronized:\n• ${syncedEmployees.length} Staff Profiles\n• ${enrolled.length} Enrolled Face Embeddings`,
+      );
+    } catch (err) {
+      Alert.alert('Sync Notice', err?.message || 'Could not connect to cloud server.');
+    } finally {
+      setIsSyncing(false);
     }
   };
 
-  const handleSelectThreshold = async (val) => {
-    setSimilarityThreshold(val);
-    await AsyncStorage.setItem('@config_threshold', val);
+  const formatLastSyncTime = (isoString) => {
+    if (!isoString) return 'Not synced yet';
+    try {
+      const d = new Date(isoString);
+      return d.toLocaleString([], {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    } catch {
+      return isoString;
+    }
   };
 
-  const handleToggleLiveness = async (val) => {
-    setLivenessEnabled(val);
-    await AsyncStorage.setItem('@config_liveness', val ? 'true' : 'false');
-  };
-
-  const handleLogout = () => {
-    Alert.alert('Lock Kiosk', 'Lock this kiosk terminal and return to Login PIN screen?', [
-      {text: 'Cancel', style: 'cancel'},
-      {
-        text: 'Lock',
-        style: 'destructive',
-        onPress: () => navigation.replace('Login'),
-      },
-    ]);
-  };
+  const isLivenessActive = Boolean(config.antiSpoofing ?? config.requireBlink);
+  const similarityScoreVal = Number(config.similarityThreshold ?? FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD);
+  const thresholdPercent = (similarityScoreVal * 100).toFixed(0);
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.title}>System Settings</Text>
-        <Text style={styles.sub}>Terminal configuration & inference controls</Text>
+        <Text style={styles.sub}>Dashboard-managed configuration & diagnostics (Read-Only)</Text>
       </View>
 
       <View style={styles.content}>
-        {/* ML Configuration Section */}
-        <Text style={styles.sectionHeader}>RECOGNITION ENGINE</Text>
-
+        {/* 1. EMPLOYEE DATA SYNC CARD */}
+        <Text style={styles.sectionHeader}>STAFF PROFILES SYNCHRONIZATION</Text>
         <View style={styles.card}>
-          <View style={styles.cardRow}>
-            <View>
-              <Text style={styles.cardTitle}>Anti-Spoofing (Liveness)</Text>
-              <Text style={styles.cardDesc}>Requires real eye blink before punching</Text>
+          <View style={styles.syncRow}>
+            <View style={styles.syncInfo}>
+              <Text style={styles.cardTitle}>Employee & Face Database</Text>
+              <Text style={styles.lastSyncText}>
+                Last Staff Sync: {formatLastSyncTime(lastSynced)}
+              </Text>
             </View>
-            <Switch
-              value={livenessEnabled}
-              onValueChange={handleToggleLiveness}
-              trackColor={{false: '#334155', true: '#16a34a'}}
-              thumbColor={livenessEnabled ? '#fff' : '#94a3b8'}
-            />
+
+            <TouchableOpacity
+              style={[styles.syncBtn, isSyncing && styles.syncBtnDisabled]}
+              onPress={handleSyncEmployees}
+              disabled={isSyncing}
+              activeOpacity={0.75}>
+              {isSyncing ? (
+                <ActivityIndicator size="small" color="#ffffff" />
+              ) : (
+                <Text style={styles.syncBtnText}>🔄 Sync Employees</Text>
+              )}
+            </TouchableOpacity>
           </View>
         </View>
 
+        {/* 2. RECOGNITION ENGINE (Dynamic Live Dashboard Settings) */}
+        <Text style={styles.sectionHeader}>DASHBOARD BIOMETRIC AI CONTROLS</Text>
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Similarity Match Threshold</Text>
-          <Text style={styles.cardDesc}>
-            Higher values reduce false positives; lower values improve recognition under low lighting.
-          </Text>
-
-          <View style={styles.thresholdRow}>
-            {['0.65', '0.70', '0.75'].map((t) => (
-              <TouchableOpacity
-                key={t}
-                style={[
-                  styles.thresholdBtn,
-                  similarityThreshold === t && styles.thresholdBtnActive,
-                ]}
-                onPress={() => handleSelectThreshold(t)}>
-                <Text
-                  style={[
-                    styles.thresholdBtnText,
-                    similarityThreshold === t && styles.thresholdBtnTextActive,
-                  ]}>
-                  {t} {t === '0.70' ? '(Default)' : t === '0.75' ? '(Strict)' : '(Lenient)'}
-                </Text>
-              </TouchableOpacity>
-            ))}
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Anti-Spoofing (Liveness Engine)</Text>
+            <View style={isLivenessActive ? styles.badgeActive : styles.badgeDisabled}>
+              <Text style={isLivenessActive ? styles.badgeActiveText : styles.badgeDisabledText}>
+                {isLivenessActive ? '● Active (Blink Required)' : '○ Disabled'}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Similarity Match Threshold</Text>
+            <Text style={styles.infoValue}>
+              {thresholdPercent}% ({similarityScoreVal})
+            </Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Enrollment Target Samples</Text>
+            <Text style={styles.infoValue}>
+              {config.enrollmentSamples || FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET} Verified Angles
+            </Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Sample Capture Interval</Text>
+            <Text style={styles.infoValue}>
+              {config.sampleIntervalMs || FACE_CONFIG.SAMPLE_INTERVAL_MS} ms
+            </Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Head Yaw Orientation Limit</Text>
+            <Text style={styles.infoValue}>
+              ±{config.yawTolerance || FACE_CONFIG.MAX_HEAD_YAW_DEGREES}°
+            </Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Duplicate Punch Cooldown</Text>
+            <Text style={styles.infoValue}>
+              {config.doublePunchLockout || FACE_CONFIG.PUNCH_COOLDOWN_MINUTES} Minutes
+            </Text>
           </View>
         </View>
 
-        {/* System Diagnostics */}
+        {/* 3. TERMINAL & SYSTEM DIAGNOSTICS */}
         <Text style={styles.sectionHeader}>TERMINAL DIAGNOSTICS</Text>
-
         <View style={styles.card}>
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Neural Network</Text>
-            <Text style={styles.infoValue}>MobileFaceNet (128-D)</Text>
+            <Text style={styles.infoLabel}>Terminal Mode</Text>
+            <Text style={styles.infoValue}>Autonomous Face Kiosk</Text>
           </View>
           <View style={styles.divider} />
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Input Resolution</Text>
-            <Text style={styles.infoValue}>112 × 112 Planar RGB</Text>
+            <Text style={styles.infoLabel}>Locally Cached Profiles</Text>
+            <Text style={styles.infoValue}>
+              {totalEnrolled} / {totalEmployees} Staff Enrolled
+            </Text>
           </View>
           <View style={styles.divider} />
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Enrolled Templates</Text>
-            <Text style={styles.infoValue}>{totalEnrolled} Registered</Text>
+            <Text style={styles.infoLabel}>Neural Network Architecture</Text>
+            <Text style={styles.infoValue}>MobileFaceNet (128-D Vector)</Text>
           </View>
           <View style={styles.divider} />
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Liveness Tracker</Text>
-            <Text style={styles.infoValue}>Google ML Kit Vision</Text>
+            <Text style={styles.infoLabel}>Neural Input Resolution</Text>
+            <Text style={styles.infoValue}>
+              {FACE_CONFIG.MODEL_INPUT_WIDTH} × {FACE_CONFIG.MODEL_INPUT_HEIGHT} Planar RGB
+            </Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Shift Alternation</Text>
+            <Text style={styles.infoValue}>Strict IN ➔ OUT ➔ IN</Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Vision Pipeline</Text>
+            <Text style={styles.infoValue}>Google ML Kit + Vision Camera</Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Platform</Text>
+            <Text style={styles.infoValue}>
+              {Platform.OS === 'android' ? 'Android Native' : Platform.OS === 'ios' ? 'iOS Native' : 'React Native'} (v0.0.1)
+            </Text>
           </View>
         </View>
-
-        {/* Lock / Exit */}
-        <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
-          <Text style={styles.logoutText}>Lock Terminal (Exit Kiosk)</Text>
-        </TouchableOpacity>
       </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {flex: 1, backgroundColor: '#0f172a'},
+  container: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+  },
+  scrollContent: {
+    paddingBottom: 40,
+  },
   header: {
     paddingHorizontal: 20,
     paddingTop: 52,
@@ -153,9 +263,19 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#1e293b',
   },
-  title: {color: '#fff', fontSize: 22, fontWeight: '700'},
-  sub: {color: '#94a3b8', fontSize: 13, marginTop: 2},
-  content: {padding: 16},
+  title: {
+    color: '#ffffff',
+    fontSize: 22,
+    fontWeight: '700',
+  },
+  sub: {
+    color: '#94a3b8',
+    fontSize: 13,
+    marginTop: 2,
+  },
+  content: {
+    padding: 16,
+  },
   sectionHeader: {
     color: '#64748b',
     fontSize: 12,
@@ -167,57 +287,95 @@ const styles = StyleSheet.create({
   },
   card: {
     backgroundColor: '#1e293b',
-    borderRadius: 12,
+    borderRadius: 14,
     padding: 16,
     borderWidth: 1,
     borderColor: '#334155',
     marginBottom: 14,
   },
-  cardRow: {
+  syncRow: {
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'space-between',
-    alignItems: 'center',
   },
-  cardTitle: {color: '#fff', fontSize: 15, fontWeight: '600'},
-  cardDesc: {color: '#94a3b8', fontSize: 12, marginTop: 3, lineHeight: 16},
-  thresholdRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 12,
-  },
-  thresholdBtn: {
+  syncInfo: {
     flex: 1,
-    backgroundColor: '#0f172a',
-    paddingVertical: 10,
-    borderRadius: 8,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#334155',
+    marginRight: 12,
   },
-  thresholdBtnActive: {
+  cardTitle: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  lastSyncText: {
+    color: '#38bdf8',
+    fontSize: 12,
+    marginTop: 4,
+    fontWeight: '500',
+  },
+  syncBtn: {
     backgroundColor: '#2563eb',
-    borderColor: '#38bdf8',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 110,
   },
-  thresholdBtnText: {color: '#94a3b8', fontSize: 12, fontWeight: '600'},
-  thresholdBtnTextActive: {color: '#fff', fontWeight: '700'},
+  syncBtnDisabled: {
+    opacity: 0.6,
+  },
+  syncBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
   infoRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 4,
   },
-  infoLabel: {color: '#94a3b8', fontSize: 13},
-  infoValue: {color: '#f8fafc', fontSize: 13, fontWeight: '600'},
-  divider: {height: 1, backgroundColor: '#334155', marginVertical: 8},
-  logoutBtn: {
-    backgroundColor: 'rgba(239, 68, 68, 0.12)',
-    borderColor: '#ef4444',
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 14,
-    alignItems: 'center',
-    marginTop: 16,
-    marginBottom: 40,
+  infoLabel: {
+    color: '#94a3b8',
+    fontSize: 13,
+    flexShrink: 1,
   },
-  logoutText: {color: '#ef4444', fontSize: 15, fontWeight: '700'},
+  infoValue: {
+    color: '#f8fafc',
+    fontSize: 13,
+    fontWeight: '600',
+    marginLeft: 8,
+  },
+  badgeActive: {
+    backgroundColor: 'rgba(34, 197, 94, 0.15)',
+    borderColor: '#22c55e',
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  badgeActiveText: {
+    color: '#4ade80',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  badgeDisabled: {
+    backgroundColor: 'rgba(100, 116, 139, 0.2)',
+    borderColor: '#64748b',
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  badgeDisabledText: {
+    color: '#94a3b8',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#334155',
+    marginVertical: 10,
+  },
 });

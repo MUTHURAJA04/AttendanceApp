@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { StyleSheet, Text, View, Dimensions, Vibration } from 'react-native';
+import { StyleSheet, Text, View, Vibration } from 'react-native';
 import {
   useCameraDevice,
   useCameraPermission,
@@ -10,28 +10,25 @@ import { useResizer } from 'react-native-vision-camera-resizer';
 import { useTensorflowModel } from 'react-native-fast-tflite';
 import { scheduleOnRN } from 'react-native-worklets';
 import { useIsFocused } from '@react-navigation/native';
-import { EmployeeStorage, ConfigStorage } from '../services/employeeStorage';
 import Sound from 'react-native-sound';
 
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const GUIDE_BOX_SIZE = Math.floor(SCREEN_WIDTH * 0.72);
-
-const MODEL_INPUT_WIDTH = 112;
-const MODEL_INPUT_HEIGHT = 112;
-const EMBEDDING_SIZE = 128;
-const NORMALIZATION_EPSILON = 1e-12;
-
-const SIMILARITY_THRESHOLD = 0.7;
-const EYE_CLOSED_THRESHOLD = 0.25;
-const EYE_OPEN_THRESHOLD = 0.65;
+import { EmployeeStorage } from '../services/employeeStorage';
+import {
+  loadKioskSettings,
+  listenForRemoteLogout,
+  subscribeToLiveSettings,
+} from '../services/kioskSettings';
+import { FACE_CONFIG } from '../constants/faceConfig';
+import { findBestFaceMatch, validateFacePose } from '../utils/faceEmbeddingUtils';
+import FaceGuideBox from '../components/FaceGuideBox';
+import AttendanceResultModal from '../components/AttendanceResultModal';
 
 export default function AttendanceScreen() {
   const isFocused = useIsFocused();
   const device = useCameraDevice('front');
   const { hasPermission, requestPermission } = useCameraPermission();
-  const [duplicateWarning, setDuplicateWarning] = useState(null);
 
-  // Model & Resizer
+  // ML Model & Frame Resizer
   const modelPlugin = useTensorflowModel(
     require('../assets/models/mobile_facenet.tflite'),
     [],
@@ -39,31 +36,36 @@ export default function AttendanceScreen() {
   const model = modelPlugin.state === 'loaded' ? modelPlugin.model : null;
 
   const { resizer } = useResizer({
-    width: MODEL_INPUT_WIDTH,
-    height: MODEL_INPUT_HEIGHT,
+    width: FACE_CONFIG.MODEL_INPUT_WIDTH,
+    height: FACE_CONFIG.MODEL_INPUT_HEIGHT,
     channelOrder: 'rgb',
     dataType: 'float32',
     pixelLayout: 'planar',
     scaleMode: 'cover',
   });
 
-  // Stored employees in memory
+  // State
   const [employees, setEmployees] = useState([]);
-  const employeesRef = useRef([]);
-
-  // Active Recognition & Liveness states
   const [activeMatch, setActiveMatch] = useState(null);
   const [liveSimilarity, setLiveSimilarity] = useState(0);
-  const [isLivenessVerified, setIsLivenessVerified] = useState(false);
-  const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'LIVENESS_VERIFIED' | 'MATCH'
+  const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'IDENTIFIED' | 'MATCH' | 'WARNING'
   const [promptText, setPromptText] = useState('Position Face in Box');
   const [punchSuccess, setPunchSuccess] = useState(null);
+  const [duplicateWarning, setDuplicateWarning] = useState(null);
+  const [threshold, setThreshold] = useState(FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD);
 
-  // Synchronization refs for callbacks
+  // Synchronization refs for callbacks and worklets
+  const employeesRef = useRef([]);
   const activeMatchRef = useRef(null);
   const liveSimilarityRef = useRef(0);
   const isCooldownRef = useRef(false);
-  const latestVectorRef = useRef(null);
+  const thresholdRef = useRef(FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD);
+  const livenessEnabledRef = useRef(true);
+  const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES);
+  const cooldownMinutesRef = useRef(FACE_CONFIG.PUNCH_COOLDOWN_MINUTES);
+  const sessionVersionRef = useRef(1);
+  const triggerPunchRef = useRef(null);
+  const employeePunchStateRef = useRef(new Map()); // Map of employeeId -> 'IN' | 'OUT'
 
   // Blink state machine refs
   const eyesWereClosed = useRef(false);
@@ -71,18 +73,13 @@ export default function AttendanceScreen() {
   const openFrameCount = useRef(0);
   const blinkCooldown = useRef(false);
 
-  const [threshold, setThreshold] = useState(0.7);
-  const [livenessEnabled, setLivenessEnabled] = useState(true);
-
-  const thresholdRef = useRef(0.7);
-  const livenessEnabledRef = useRef(true);
-
   const chimeSoundRef = useRef(null);
 
+  // Setup sound effect
   useEffect(() => {
     const chime = new Sound('alert.mp3', Sound.MAIN_BUNDLE, (error) => {
       if (error) {
-        console.warn('Failed to load success sound', error);
+        console.warn('[Sound] Sound file not found or failed to load:', error);
         chimeSoundRef.current = null;
       } else {
         chimeSoundRef.current = chime;
@@ -96,30 +93,103 @@ export default function AttendanceScreen() {
     };
   }, []);
 
-  // Reload employee database whenever tab comes into focus
+  // Request camera permissions if needed
   useEffect(() => {
-    if (isFocused) {
-      loadEmployees();
-      resetKiosk();
-
-      ConfigStorage.getConfig().then(cfg => {
-        setThreshold(cfg.threshold);
-        thresholdRef.current = cfg.threshold;
-        setLivenessEnabled(cfg.liveness);
-        livenessEnabledRef.current = cfg.liveness;
-        console.log(
-          `[CONFIG LOADED] Threshold: ${cfg.threshold}, Liveness: ${cfg.liveness}`,
-        );
-      });
+    if (!hasPermission) {
+      requestPermission();
     }
-  }, [isFocused]);
+  }, [hasPermission, requestPermission]);
 
-  const loadEmployees = async () => {
-    const list = await EmployeeStorage.getAllEmployees();
-    setEmployees(list);
-    employeesRef.current = list;
-    console.log(`[ATTENDANCE] Loaded ${list.length} active employee profiles`);
-  };
+  const refreshTodayPunchStates = useCallback(async () => {
+    try {
+      const logs = await EmployeeStorage.getAttendanceLogs();
+      const todayDateStr = new Date().toDateString();
+      const stateMap = new Map();
+
+      // Sort logs ascending so later logs overwrite earlier ones
+      const sortedAsc = [...logs].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+      );
+
+      for (const log of sortedAsc) {
+        if (new Date(log.timestamp).toDateString() === todayDateStr && log.employeeId) {
+          stateMap.set(String(log.employeeId), String(log.type || 'IN').toUpperCase());
+        }
+      }
+
+      employeePunchStateRef.current = stateMap;
+    } catch {
+      // Non-blocking
+    }
+  }, []);
+
+  const loadEmployeeProfiles = useCallback(async () => {
+    // 1. Fast load from local storage
+    const localList = await EmployeeStorage.getAllEmployees();
+    const enrolledOnly = localList.filter((e) => e.hasFace && e.template);
+    setEmployees(enrolledOnly);
+    employeesRef.current = enrolledOnly;
+
+    // 2. Refresh today's punch state map for all employees
+    await refreshTodayPunchStates();
+
+    // 3. Background sync from cloud in case web added new staff or updated embeddings
+    EmployeeStorage.syncEmployeesFromCloud()
+      .then(async (updatedList) => {
+        const updatedEnrolled = updatedList.filter((e) => e.hasFace && e.template);
+        setEmployees(updatedEnrolled);
+        employeesRef.current = updatedEnrolled;
+        await refreshTodayPunchStates();
+      })
+      .catch((e) => console.log('[AttendanceScreen] Cloud sync non-critical warning:', e));
+  }, [refreshTodayPunchStates]);
+
+  // Apply live kiosk settings helper
+  const applyKioskSettings = useCallback((cfg) => {
+    if (!cfg) return;
+    const thresh = Number(cfg.similarityThreshold ?? FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD);
+    const liveness = cfg.antiSpoofing !== undefined ? Boolean(cfg.antiSpoofing) : Boolean(cfg.requireBlink ?? true);
+    const yaw = Number(cfg.yawTolerance ?? FACE_CONFIG.MAX_HEAD_YAW_DEGREES);
+    const cooldown = Number(cfg.doublePunchLockout ?? FACE_CONFIG.PUNCH_COOLDOWN_MINUTES);
+    const sessionVer = Number(cfg.sessionVersion ?? 1);
+
+    setThreshold(thresh);
+    thresholdRef.current = thresh;
+    livenessEnabledRef.current = liveness;
+    yawAngleToleranceRef.current = yaw;
+    cooldownMinutesRef.current = cooldown;
+    sessionVersionRef.current = sessionVer;
+  }, []);
+
+  // Reload employee profiles & live DB config when screen gains focus, plus real-time listeners
+  useEffect(() => {
+    if (!isFocused) return;
+
+    loadEmployeeProfiles();
+    resetKiosk();
+
+    // 1. Initial live configuration fetch from DB
+    loadKioskSettings().then((cfg) => {
+      applyKioskSettings(cfg);
+    });
+
+    // 2. Subscribe to real-time configuration changes from Web Dashboard
+    const liveSettingsSub = subscribeToLiveSettings((updated) => {
+      console.log('[AttendanceScreen] Applying updated live settings from dashboard:', updated);
+      applyKioskSettings(updated);
+    });
+
+    // 3. Subscribe to remote security logout
+    const remoteLogoutSub = listenForRemoteLogout(sessionVersionRef.current, () => {
+      console.warn('[AttendanceScreen] Remote logout event received');
+      resetKiosk();
+    });
+
+    return () => {
+      if (liveSettingsSub?.unsubscribe) liveSettingsSub.unsubscribe();
+      if (remoteLogoutSub?.unsubscribe) remoteLogoutSub.unsubscribe();
+    };
+  }, [isFocused, loadEmployeeProfiles, applyKioskSettings]);
 
   const resetKiosk = () => {
     isCooldownRef.current = false;
@@ -127,38 +197,37 @@ export default function AttendanceScreen() {
     activeMatchRef.current = null;
     setLiveSimilarity(0);
     liveSimilarityRef.current = 0;
-    setIsLivenessVerified(false);
     setBoxState('DEFAULT');
     setPromptText('Position Face in Box');
     setPunchSuccess(null);
+    setDuplicateWarning(null);
     eyesWereClosed.current = false;
     closedFrameCount.current = 0;
     openFrameCount.current = 0;
     blinkCooldown.current = false;
-    setDuplicateWarning(null);
   };
 
-  useEffect(() => {
-    if (!hasPermission) requestPermission();
-  }, [hasPermission, requestPermission]);
-
   // ============================================================
-  // ATTENDANCE RECORDING (Punch DB + UI Lockout)
+  // ATTENDANCE PUNCH EXECUTION (Local DB + Cloud + UI Lockout)
   // ============================================================
-const triggerAttendancePunch = async (employee, score) => {
+  const triggerAttendancePunch = async (employee, score) => {
     if (isCooldownRef.current) return;
     isCooldownRef.current = true;
 
-    // 1. Process punch rule in storage (checks duplicate & alternates IN/OUT)
+    // 1. Record punch in storage (evaluates duplicate lockout & alternates strictly IN -> OUT -> IN)
     const result = await EmployeeStorage.logAttendancePunch({
       employeeId: employee.id,
       employeeName: employee.name,
+      department: employee.department,
+      branchId: employee.branch_id || employee.branchId,
+      cooldownMinutes: cooldownMinutesRef.current,
       similarityScore: score,
     });
 
-    // --- CASE A: DUPLICATE PUNCH (< 2 mins) ---
+    // --- CASE A: DUPLICATE PUNCH (< 2 minutes) ---
     if (result.status === 'DUPLICATE_BLOCKED') {
-      Vibration.vibrate(300); // Rejection buzz
+      Vibration.vibrate(350);
+      setBoxState('WARNING');
       setPromptText(`Already Punched ${result.lastType}!`);
 
       setDuplicateWarning({
@@ -169,12 +238,12 @@ const triggerAttendancePunch = async (employee, score) => {
 
       setTimeout(() => {
         resetKiosk();
-      }, 3500);
+      }, FACE_CONFIG.PUNCH_DUPLICATE_LOCKOUT_MS);
       return;
     }
 
-    // --- CASE B: SUCCESSFUL PUNCH (IN / OUT) ---
-    Vibration.vibrate([0, 60, 40, 60]);
+    // --- CASE B: SUCCESSFUL VERIFICATION & PUNCH (IN / OUT) ---
+    Vibration.vibrate([0, 70, 50, 70]);
 
     if (chimeSoundRef.current) {
       chimeSoundRef.current.stop(() => {
@@ -185,15 +254,18 @@ const triggerAttendancePunch = async (employee, score) => {
     }
 
     const punch = result.punch;
+    
+    // Update in-memory punch status for this employee
+    employeePunchStateRef.current.set(String(employee.id), punch.type);
+
     setBoxState('MATCH');
-    setIsLivenessVerified(true);
-    setPromptText(`${employee.name}: Checked ${punch.type}!`);
+    setPromptText(`${employee.name}: PRESENT (Checked ${punch.type})!`);
 
     setPunchSuccess({
       name: employee.name,
       id: employee.id,
-      department: employee.department || 'General',
-      type: punch.type, // 'IN' or 'OUT'
+      department: employee.department || 'Staff',
+      type: punch.type,
       time: new Date().toLocaleTimeString([], {
         hour: '2-digit',
         minute: '2-digit',
@@ -202,26 +274,28 @@ const triggerAttendancePunch = async (employee, score) => {
       score: (score * 100).toFixed(0),
     });
 
-    console.log(`✅ ATTENDANCE PUNCHED [${punch.type}]: ${employee.name} (${employee.id})`);
+    console.log(`[Attendance] ✓ Verified: ${employee.name} | Type: ${punch.type} | Score: ${(score * 100).toFixed(1)}%`);
 
-    // 4-second lockout before returning to detection mode
+    // Lockout period before returning to search mode
     setTimeout(() => {
       resetKiosk();
-    }, 4000);
+    }, FACE_CONFIG.PUNCH_SUCCESS_LOCKOUT_MS);
   };
+
+  triggerPunchRef.current = triggerAttendancePunch;
 
   // ============================================================
   // PHASE 1: ML KIT FACE DETECTION, POSE & BLINK LIVENESS
   // ============================================================
   const handleFacesDetected = useCallback(
-    faces => {
+    (faces) => {
       if (isCooldownRef.current || !isFocused) return;
 
-      // 1. Detect presence
-      if (!Array.isArray(faces) || faces.length === 0) {
-        setBoxState('DEFAULT');
-        setPromptText('Position Face in Box');
-        setIsLivenessVerified(false);
+      const validation = validateFacePose(faces, yawAngleToleranceRef.current);
+
+      if (!validation.isValid) {
+        setBoxState(validation.status === 'NO_FACE' ? 'DEFAULT' : 'WARNING');
+        setPromptText(validation.message);
         setActiveMatch(null);
         activeMatchRef.current = null;
         eyesWereClosed.current = false;
@@ -230,43 +304,24 @@ const triggerAttendancePunch = async (employee, score) => {
         return;
       }
 
-      // 2. Reject multiple faces
-      if (faces.length > 1) {
-        setBoxState('DEFAULT');
-        setPromptText('Only One Person Allowed');
-        setIsLivenessVerified(false);
-        setActiveMatch(null);
-        activeMatchRef.current = null;
-        return;
-      }
-
-      const face = faces[0];
-      const yaw = typeof face.yawAngle === 'number' ? face.yawAngle : 0;
-
-      // 3. Pose validation (Must look head-on)
-      if (Math.abs(yaw) > 15) {
-        setBoxState('DEFAULT');
-        setPromptText(
-          yaw > 15 ? 'Turn Left toward Camera' : 'Turn Right toward Camera',
-        );
-        return;
-      }
-
-      // If face is aligned straight, check matching status
+      const face = validation.face;
       const currentMatchedEmp = activeMatchRef.current;
 
       if (currentMatchedEmp) {
-        setBoxState('ALIGNED');
+        setBoxState('IDENTIFIED');
+        
+        // Check current punch status to tell user whether they are checking IN or checking OUT
+        const currentPunchType = employeePunchStateRef.current.get(String(currentMatchedEmp.id)) || 'OUT';
+        const nextAction = currentPunchType === 'IN' ? 'Check OUT' : 'Check IN';
+
         if (!livenessEnabledRef.current) {
-          setPromptText(
-            `Hi ${currentMatchedEmp.name}! Processing attendance...`,
-          );
+          setPromptText(`Hi ${currentMatchedEmp.name}! Processing ${nextAction}...`);
         } else {
-          setPromptText(`Hi ${currentMatchedEmp.name}! Blink to Punch`);
+          setPromptText(`Hi ${currentMatchedEmp.name}! Blink to ${nextAction}`);
         }
       } else if (employeesRef.current.length === 0) {
         setBoxState('DEFAULT');
-        setPromptText('No Employees Registered in System');
+        setPromptText('No Enrolled Employees Locally');
         return;
       } else {
         setBoxState('ALIGNED');
@@ -284,9 +339,11 @@ const triggerAttendancePunch = async (employee, score) => {
           : 1.0;
 
       const eyesClosed =
-        leftEye < EYE_CLOSED_THRESHOLD && rightEye < EYE_CLOSED_THRESHOLD;
+        leftEye < FACE_CONFIG.EYE_CLOSED_THRESHOLD &&
+        rightEye < FACE_CONFIG.EYE_CLOSED_THRESHOLD;
       const eyesOpen =
-        leftEye > EYE_OPEN_THRESHOLD && rightEye > EYE_OPEN_THRESHOLD;
+        leftEye > FACE_CONFIG.EYE_OPEN_THRESHOLD &&
+        rightEye > FACE_CONFIG.EYE_OPEN_THRESHOLD;
 
       if (eyesClosed) {
         closedFrameCount.current += 1;
@@ -304,13 +361,12 @@ const triggerAttendancePunch = async (employee, score) => {
           openFrameCount.current >= 1 &&
           !blinkCooldown.current
         ) {
-          console.log('👁️ NATURAL BLINK CONFIRMED');
           eyesWereClosed.current = false;
           blinkCooldown.current = true;
 
-          // If face is identified when blink finishes -> Stamp attendance!
-          if (currentMatchedEmp) {
-            triggerAttendancePunch(
+          // If face is identified when blink completes -> Stamp attendance
+          if (currentMatchedEmp && triggerPunchRef.current) {
+            triggerPunchRef.current(
               currentMatchedEmp,
               liveSimilarityRef.current,
             );
@@ -328,12 +384,11 @@ const triggerAttendancePunch = async (employee, score) => {
   );
 
   // ============================================================
-  // PHASE 2: CONTINUOUS 1:N RECOGNITION (MobileFaceNet)
+  // PHASE 2: CONTINUOUS 1:N RECOGNITION (MobileFaceNet Embedding)
   // ============================================================
-  const handleEmbeddingFromWorklet = embeddingArray => {
+  const handleEmbeddingFromWorklet = (embeddingArray) => {
     if (isCooldownRef.current || !isFocused) return;
 
-    latestVectorRef.current = embeddingArray;
     const currentList = employeesRef.current;
     if (!currentList || currentList.length === 0) {
       setActiveMatch(null);
@@ -343,35 +398,23 @@ const triggerAttendancePunch = async (employee, score) => {
       return;
     }
 
-    const liveVec = new Float32Array(embeddingArray);
-    let bestMatch = null;
-    let highestSim = -1;
+    // Fast 1:N vector cosine similarity verification
+    const { bestMatch, similarityScore, isMatch } = findBestFaceMatch(
+      embeddingArray,
+      currentList,
+      thresholdRef.current,
+    );
 
-    // Fast 1:N dot product search
-    for (let i = 0; i < currentList.length; i++) {
-      const emp = currentList[i];
-      const storedTemplate = emp.template;
-      let dot = 0;
-      for (let j = 0; j < EMBEDDING_SIZE; j++) {
-        dot += liveVec[j] * storedTemplate[j];
-      }
+    liveSimilarityRef.current = similarityScore;
+    setLiveSimilarity(similarityScore);
 
-      if (dot > highestSim) {
-        highestSim = dot;
-        bestMatch = emp;
-      }
-    }
-
-    liveSimilarityRef.current = highestSim;
-    setLiveSimilarity(highestSim);
-
-    if (highestSim >= thresholdRef.current && bestMatch != null) {
+    if (isMatch && bestMatch != null) {
       setActiveMatch(bestMatch);
       activeMatchRef.current = bestMatch;
 
-      // ✅ If Liveness is DISABLED, punch immediately without waiting for a blink!
-      if (!livenessEnabledRef.current) {
-        triggerAttendancePunch(bestMatch, highestSim);
+      // If Liveness is turned off, punch immediately without waiting for blink
+      if (!livenessEnabledRef.current && triggerPunchRef.current) {
+        triggerPunchRef.current(bestMatch, similarityScore);
       }
     } else {
       setActiveMatch(null);
@@ -380,11 +423,10 @@ const triggerAttendancePunch = async (employee, score) => {
   };
 
   // ============================================================
-  // WORKLET PIPELINE
+  // WORKLET PIPELINE (Camera Frames -> TFLite -> Embeddings)
   // ============================================================
   const frameOutput = useFrameOutput({
     pixelFormat: 'yuv',
-
     onFrame(frame) {
       'worklet';
 
@@ -397,7 +439,6 @@ const triggerAttendancePunch = async (employee, score) => {
         const resized = resizer.resize(frame);
 
         try {
-          // ✅ CORRECT (handles single or dual-input tensor models):
           const buffer = resized.getPixelBuffer();
           const modelInputs =
             model.inputs.length === 2 ? [buffer, buffer] : [buffer];
@@ -405,18 +446,18 @@ const triggerAttendancePunch = async (employee, score) => {
           if (!outputs || outputs.length === 0) return;
 
           const output = new Float32Array(outputs[0]);
-          if (output.length < EMBEDDING_SIZE) return;
+          if (output.length < FACE_CONFIG.EMBEDDING_SIZE) return;
 
           let sumSquares = 0;
-          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+          for (let i = 0; i < FACE_CONFIG.EMBEDDING_SIZE; i++) {
             sumSquares += output[i] * output[i];
           }
 
           const rawMagnitude = Math.sqrt(sumSquares);
-          const safeMagnitude = Math.max(rawMagnitude, NORMALIZATION_EPSILON);
+          const safeMagnitude = Math.max(rawMagnitude, FACE_CONFIG.NORMALIZATION_EPSILON);
 
-          const rawArr = new Array(EMBEDDING_SIZE);
-          for (let i = 0; i < EMBEDDING_SIZE; i++) {
+          const rawArr = new Array(FACE_CONFIG.EMBEDDING_SIZE);
+          for (let i = 0; i < FACE_CONFIG.EMBEDDING_SIZE; i++) {
             rawArr[i] = output[i] / safeMagnitude;
           }
 
@@ -440,18 +481,6 @@ const triggerAttendancePunch = async (employee, score) => {
     );
   }
 
-  // Dynamic box styling based on current state
-  const getBoxStyle = () => {
-    switch (boxState) {
-      case 'MATCH':
-        return styles.guideBoxMatch;
-      case 'ALIGNED':
-        return activeMatch ? styles.guideBoxIdentified : styles.guideBoxAligned;
-      default:
-        return styles.guideBoxDefault;
-    }
-  };
-
   return (
     <View style={styles.container}>
       {isFocused && (
@@ -466,69 +495,21 @@ const triggerAttendancePunch = async (employee, score) => {
         />
       )}
 
-      {/* Center Alignment Box with Dynamic State Borders */}
-      <View style={styles.guideContainer} pointerEvents="none">
-        <View style={[styles.guideBox, getBoxStyle()]} />
-        <Text style={styles.guideSubText}>Keep face steady inside frame</Text>
-      </View>
+      {/* Reusable Guide Overlay & Guidance Pill */}
+      <FaceGuideBox
+        boxState={boxState}
+        promptText={promptText}
+        subText="Keep face steady inside frame"
+        isIdentified={Boolean(activeMatch)}
+      />
 
-      {/* Floating Status & Guidance Pill */}
-      <View style={styles.pillContainer} pointerEvents="none">
-        <View
-          style={[
-            styles.pill,
-            activeMatch && styles.pillIdentified,
-            boxState === 'MATCH' && styles.pillMatch,
-          ]}
-        >
-          <Text style={styles.pillText}>{promptText}</Text>
-        </View>
-      </View>
+      {/* Reusable Attendance Verification Modal (IN / OUT / Duplicate) */}
+      <AttendanceResultModal
+        punchSuccess={punchSuccess}
+        duplicateWarning={duplicateWarning}
+      />
 
-      {/* Attendance Punch Confirmation Modal */}
-    {/* Attendance Success Modal (IN / OUT Badge) */}
-      {punchSuccess && (
-        <View
-          style={[
-            styles.successModal,
-            punchSuccess.type === 'OUT' ? styles.modalOut : styles.modalIn,
-          ]}>
-          <View style={styles.typeBadge}>
-            <Text style={styles.typeBadgeText}>
-              {punchSuccess.type === 'IN' ? 'CHECK-IN' : 'CHECK-OUT'}
-            </Text>
-          </View>
-          <Text style={styles.successIcon}>
-            {punchSuccess.type === 'IN' ? '✓' : '👋'}
-          </Text>
-          <Text style={styles.successTitle}>
-            {punchSuccess.type === 'IN' ? 'Welcome!' : 'Goodbye!'}
-          </Text>
-          <Text style={styles.successName}>{punchSuccess.name}</Text>
-          <Text style={styles.successSub}>
-            {punchSuccess.department} • {punchSuccess.time}
-          </Text>
-          <Text style={styles.successConfidence}>
-            Confidence: {punchSuccess.score}%
-          </Text>
-        </View>
-      )}
-
-      {/* Duplicate Punch Blocked Warning */}
-      {duplicateWarning && (
-        <View style={styles.duplicateModal}>
-          <Text style={styles.duplicateIcon}>⚠️</Text>
-          <Text style={styles.duplicateTitle}>
-            Already Punched {duplicateWarning.lastType}!
-          </Text>
-          <Text style={styles.duplicateName}>{duplicateWarning.name}</Text>
-          <Text style={styles.duplicateSub}>
-            Please wait {duplicateWarning.waitSeconds}s before punching again.
-          </Text>
-        </View>
-      )}
-
-      {/* Bottom Live Metrics Bar */}
+      {/* Bottom Live Metrics & Enrolled Database Status */}
       <View style={styles.overlay}>
         <View style={styles.headerRow}>
           <Text style={styles.title}>Attendance Kiosk</Text>
@@ -539,19 +520,18 @@ const triggerAttendancePunch = async (employee, score) => {
           style={[
             styles.matchCard,
             activeMatch ? styles.cardMatch : styles.cardWaiting,
-          ]}
-        >
+          ]}>
           <Text style={styles.matchTitle}>
             {activeMatch
               ? `IDENTIFIED: ${activeMatch.name.toUpperCase()}`
               : employees.length === 0
-              ? 'NO ENROLLED EMPLOYEES'
-              : 'SEARCHING DATABASE...'}
+              ? 'NO ENROLLED EMPLOYEES LOCALLY'
+              : 'SEARCHING LOCAL DATABASE...'}
           </Text>
 
           <Text style={styles.similarityText}>
             Match Score: {(liveSimilarity * 100).toFixed(0)}% (Threshold:{' '}
-            {SIMILARITY_THRESHOLD * 100}%)
+            {(threshold * 100).toFixed(0)}%)
           </Text>
         </View>
       </View>
@@ -562,132 +542,33 @@ const triggerAttendancePunch = async (employee, score) => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#000',
+    backgroundColor: '#000000',
   },
   center: {
     flex: 1,
-    backgroundColor: '#000',
+    backgroundColor: '#000000',
     alignItems: 'center',
     justifyContent: 'center',
   },
   text: {
-    color: '#fff',
+    color: '#ffffff',
     fontSize: 16,
-  },
-  guideContainer: {
-    position: 'absolute',
-    top: 0,
-    bottom: 120,
-    left: 0,
-    right: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  guideBox: {
-    width: GUIDE_BOX_SIZE,
-    height: GUIDE_BOX_SIZE,
-    borderRadius: 24,
-    borderWidth: 2,
-  },
-  guideBoxDefault: {
-    borderColor: 'rgba(255, 255, 255, 0.45)',
-  },
-  guideBoxAligned: {
-    borderColor: '#f59e0b', // Yellow: oriented, ready to blink
-    borderWidth: 2.5,
-  },
-  guideBoxIdentified: {
-    borderColor: '#38bdf8', // Cyan: recognized, waiting for confirmation blink
-    borderWidth: 3,
-  },
-  guideBoxMatch: {
-    borderColor: '#22c55e', // Green: attendance punched!
-    borderWidth: 4,
-  },
-  guideSubText: {
-    color: 'rgba(255, 255, 255, 0.75)',
-    fontSize: 12,
-    marginTop: 10,
-    fontWeight: '500',
-  },
-  pillContainer: {
-    position: 'absolute',
-    top: 55,
-    left: 20,
-    right: 20,
-    alignItems: 'center',
-  },
-  pill: {
-    backgroundColor: 'rgba(15, 23, 42, 0.90)',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: '#475569',
-  },
-  pillIdentified: {
-    backgroundColor: '#0369a1',
-    borderColor: '#38bdf8',
-  },
-  pillMatch: {
-    backgroundColor: '#166534',
-    borderColor: '#22c55e',
-  },
-  pillText: {
-    color: '#fff',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  successModal: {
-    position: 'absolute',
-    top: '30%',
-    left: 30,
-    right: 30,
-    backgroundColor: '#15803d',
-    borderRadius: 20,
-    padding: 24,
-    alignItems: 'center',
-    elevation: 16,
-    zIndex: 100,
-  },
-  successIcon: {
-    color: '#fff',
-    fontSize: 44,
-    fontWeight: 'bold',
-  },
-  successTitle: {
-    color: '#fff',
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginTop: 4,
-  },
-  successName: {
-    color: '#f0fdf4',
-    fontSize: 18,
-    fontWeight: '700',
-    marginTop: 6,
-  },
-  successSub: {
-    color: '#bbf7d0',
-    fontSize: 13,
-    marginTop: 4,
-  },
-  successConfidence: {
-    color: '#86efac',
-    fontSize: 12,
-    marginTop: 8,
-    fontWeight: '600',
   },
   overlay: {
     position: 'absolute',
-    left: 20,
-    right: 20,
-    bottom: 25,
+    left: 18,
+    right: 18,
+    bottom: 22,
     padding: 16,
     borderRadius: 16,
-    backgroundColor: 'rgba(15, 23, 42, 0.94)',
+    backgroundColor: 'rgba(15, 23, 42, 0.95)',
     borderWidth: 1,
     borderColor: '#334155',
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 5,
   },
   headerRow: {
     flexDirection: 'row',
@@ -695,7 +576,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   title: {
-    color: '#fff',
+    color: '#ffffff',
     fontSize: 17,
     fontWeight: '700',
   },
@@ -725,7 +606,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   matchTitle: {
-    color: '#fff',
+    color: '#ffffff',
     fontSize: 15,
     fontWeight: '700',
   },
@@ -734,30 +615,4 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 4,
   },
-  modalIn: {backgroundColor: '#15803d'},
-  modalOut: {backgroundColor: '#b45309'},
-  typeBadge: {
-    backgroundColor: 'rgba(255, 255, 255, 0.25)',
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderRadius: 12,
-    marginBottom: 6,
-  },
-  typeBadgeText: {color: '#fff', fontSize: 12, fontWeight: '800', letterSpacing: 1},
-  duplicateModal: {
-    position: 'absolute',
-    top: '30%',
-    left: 30,
-    right: 30,
-    backgroundColor: '#b45309',
-    borderRadius: 20,
-    padding: 24,
-    alignItems: 'center',
-    elevation: 16,
-    zIndex: 100,
-  },
-  duplicateIcon: {fontSize: 40},
-  duplicateTitle: {color: '#fff', fontSize: 18, fontWeight: 'bold', marginTop: 4},
-  duplicateName: {color: '#fef3c7', fontSize: 16, fontWeight: '700', marginTop: 4},
-  duplicateSub: {color: '#fef3c7', fontSize: 13, marginTop: 6, textAlign: 'center'},
 });

@@ -1,18 +1,18 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   StyleSheet,
   Text,
   View,
   FlatList,
-  TouchableOpacity,
   TextInput,
   ActivityIndicator,
   RefreshControl,
   Alert,
 } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
-import { supabase } from '../services/supabase';
+import { EmployeeStorage } from '../services/employeeStorage';
 import RegisterFaceModal from './RegisterFaceModal';
+import EmployeeItemCard from '../components/EmployeeItemCard';
 
 export default function EmployeesScreen() {
   const isFocused = useIsFocused();
@@ -23,92 +23,69 @@ export default function EmployeesScreen() {
   const [showRegisterModal, setShowRegisterModal] = useState(false);
   const [selectedEmployee, setSelectedEmployee] = useState(null);
 
-  // 1. Fetch employees with face_embedding & face_updated_at
-  const loadData = async () => {
+  // Load employees from Local Storage & Sync with Supabase Cloud
+  const loadEmployeesData = useCallback(async (isPullRefresh = false) => {
     try {
-      setLoading(true);
+      if (!isPullRefresh) setLoading(true);
 
-      const { data, error } = await supabase
-        .from('employees')
-        .select(`
-          id,
-          full_name,
-          employee_code,
-          role,
-          department,
-          phone,
-          status,
-          face_embedding,
-          face_updated_at
-        `)
-        .eq('status', 'ACTIVE')
-        .order('full_name', { ascending: true });
-
-      if (error) {
-        throw error;
+      // 1. Initial immediate load from local cache
+      const localData = await EmployeeStorage.getAllEmployees();
+      if (localData && localData.length > 0) {
+        setEmployees(localData);
       }
 
-      // Map backend fields to screen UI
-      const formatted = (data || []).map((emp) => {
-        const hasFace =
-          emp.face_embedding !== null &&
-          Array.isArray(emp.face_embedding) &&
-          emp.face_embedding.length > 0;
-
-        return {
-          id: emp.id,
-          name: emp.full_name || 'Unnamed Staff',
-          code: emp.employee_code || emp.id.slice(0, 6).toUpperCase(),
-          department: emp.department || emp.role || 'General',
-          phone: emp.phone,
-          hasFace: hasFace,
-          faceEmbedding: emp.face_embedding,
-          faceUpdatedAt: emp.face_updated_at,
-        };
-      });
-
-      setEmployees(formatted);
+      // 2. Fetch fresh updates from cloud and update local storage
+      const syncedData = await EmployeeStorage.syncEmployeesFromCloud();
+      setEmployees(syncedData);
     } catch (err) {
-      console.error('[Fetch Employees Error]:', err);
-      Alert.alert('Error', err.message || 'Failed to load employees.');
+      console.error('[EmployeesScreen] Load error:', err);
+      // If error occurs, at least ensure local data is shown
+      const fallbackData = await EmployeeStorage.getAllEmployees();
+      setEmployees(fallbackData);
+      if (isPullRefresh) {
+        Alert.alert('Sync Notice', 'Could not reach cloud database. Showing local offline data.');
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     if (isFocused) {
-      loadData();
+      loadEmployeesData(false);
     }
-  }, [isFocused]);
+  }, [isFocused, loadEmployeesData]);
 
   const onRefresh = () => {
     setRefreshing(true);
-    loadData();
+    loadEmployeesData(true);
   };
 
-  // Filter employees based on search bar
-  const filteredEmployees = employees.filter(
-    (e) =>
-      e.name.toLowerCase().includes(search.toLowerCase()) ||
-      e.code.toLowerCase().includes(search.toLowerCase()) ||
-      e.department?.toLowerCase().includes(search.toLowerCase()) ||
-      e.phone?.includes(search)
-  );
+  // Filter employees based on search query
+  const filteredEmployees = employees.filter((e) => {
+    const q = search.toLowerCase().trim();
+    if (!q) return true;
+    return (
+      (e.name && e.name.toLowerCase().includes(q)) ||
+      (e.code && e.code.toLowerCase().includes(q)) ||
+      (e.department && e.department.toLowerCase().includes(q)) ||
+      (e.phone && e.phone.includes(q))
+    );
+  });
 
   const enrolledCount = employees.filter((e) => e.hasFace).length;
 
   return (
     <View style={styles.container}>
-      {/* Header */}
+      {/* Screen Header */}
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Staff Directory</Text>
           <Text style={styles.subtitle}>
             {loading
-              ? 'Loading...'
-              : `${enrolledCount} / ${employees.length} Faces Enrolled`}
+              ? 'Loading profiles...'
+              : `${enrolledCount} / ${employees.length} Faces Enrolled Locally`}
           </Text>
         </View>
       </View>
@@ -121,31 +98,32 @@ export default function EmployeesScreen() {
           placeholderTextColor="#64748b"
           value={search}
           onChangeText={setSearch}
+          clearButtonMode="while-editing"
         />
       </View>
 
       {/* Employee List */}
-      {loading ? (
+      {loading && employees.length === 0 ? (
         <View style={styles.emptyContainer}>
           <ActivityIndicator size="large" color="#38bdf8" />
-          <Text style={styles.emptySub}>Loading staff from database...</Text>
+          <Text style={styles.emptySub}>Loading staff records...</Text>
         </View>
       ) : filteredEmployees.length === 0 ? (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyTitle}>
-            {search ? 'No matching employee found' : 'No employees in database'}
+            {search ? 'No matching employee found' : 'No staff registered'}
           </Text>
           <Text style={styles.emptySub}>
             {search
-              ? 'Try another search term'
-              : 'Add employees from web dashboard to see them here.'}
+              ? 'Try adjusting your search keywords.'
+              : 'Add staff members to database or pull down to refresh.'}
           </Text>
         </View>
       ) : (
         <FlatList
           data={filteredEmployees}
-          keyExtractor={(item) => item.id}
-          contentContainerStyle={{ padding: 16 }}
+          keyExtractor={(item) => String(item.id)}
+          contentContainerStyle={styles.listContent}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -154,90 +132,42 @@ export default function EmployeesScreen() {
             />
           }
           renderItem={({ item }) => (
-            <View style={styles.card}>
-              {/* Avatar Initial */}
-              <View
-                style={[
-                  styles.avatar,
-                  item.hasFace ? styles.avatarEnrolled : styles.avatarUnenrolled,
-                ]}
-              >
-                <Text style={styles.avatarText}>
-                  {item.name ? item.name.charAt(0).toUpperCase() : '?'}
-                </Text>
-              </View>
-
-              {/* Info & Face Status */}
-              <View style={{ flex: 1 }}>
-                <Text style={styles.empName}>{item.name}</Text>
-                <Text style={styles.empId}>
-                  Code: {item.code} • {item.department}
-                </Text>
-
-                {/* Face Status Pill */}
-                <View style={styles.statusRow}>
-                  <View
-                    style={[
-                      styles.statusDot,
-                      item.hasFace ? styles.dotGreen : styles.dotAmber,
-                    ]}
-                  />
-                  <Text
-                    style={[
-                      styles.statusText,
-                      item.hasFace ? styles.textGreen : styles.textAmber,
-                    ]}
-                  >
-                    {item.hasFace ? 'Face Enrolled' : 'No Face'}
-                  </Text>
-                </View>
-              </View>
-
-              {/* Button: "Update Face" if enrolled, "+ Enroll" if not */}
-              <TouchableOpacity
-                style={[
-                  styles.actionBtn,
-                  item.hasFace ? styles.updateBtn : styles.enrollBtn,
-                ]}
-                onPress={() => {
-                  setSelectedEmployee(item);
-                  setShowRegisterModal(true);
-                }}
-              >
-                <Text
-                  style={[
-                    styles.actionBtnText,
-                    item.hasFace ? styles.updateBtnText : styles.enrollBtnText,
-                  ]}
-                >
-                  {item.hasFace ? 'Update' : '+ Enroll'}
-                </Text>
-              </TouchableOpacity>
-            </View>
+            <EmployeeItemCard
+              employee={item}
+              onEnrollPress={() => {
+                setSelectedEmployee(item);
+                setShowRegisterModal(true);
+              }}
+            />
           )}
         />
       )}
 
       {/* Face Registration / Update Modal */}
-      <RegisterFaceModal
-        visible={showRegisterModal}
-        employee={selectedEmployee}
-        onClose={() => {
-          setSelectedEmployee(null);
-          setShowRegisterModal(false);
-        }}
-        onEnrolled={() => {
-          setSelectedEmployee(null);
-          setShowRegisterModal(false);
-          loadData(); // Re-fetch to update the badge immediately
-        }}
-      />
+      {showRegisterModal && selectedEmployee && (
+        <RegisterFaceModal
+          visible={showRegisterModal}
+          employee={selectedEmployee}
+          onClose={() => {
+            setSelectedEmployee(null);
+            setShowRegisterModal(false);
+          }}
+          onEnrolled={() => {
+            setSelectedEmployee(null);
+            setShowRegisterModal(false);
+            loadEmployeesData(false); // Reload to update face badges
+          }}
+        />
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f172a' },
+  container: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+  },
   header: {
     paddingHorizontal: 20,
     paddingTop: 52,
@@ -245,9 +175,21 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#1e293b',
   },
-  title: { color: '#ffffff', fontSize: 22, fontWeight: '700' },
-  subtitle: { color: '#38bdf8', fontSize: 13, marginTop: 4, fontWeight: '600' },
-  searchContainer: { paddingHorizontal: 16, paddingTop: 14 },
+  title: {
+    color: '#ffffff',
+    fontSize: 22,
+    fontWeight: '700',
+  },
+  subtitle: {
+    color: '#38bdf8',
+    fontSize: 13,
+    marginTop: 4,
+    fontWeight: '600',
+  },
+  searchContainer: {
+    paddingHorizontal: 16,
+    paddingTop: 14,
+  },
   searchInput: {
     backgroundColor: '#1e293b',
     color: '#ffffff',
@@ -258,42 +200,24 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#334155',
   },
-  emptyContainer: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 20 },
-  emptyTitle: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
-  emptySub: { color: '#64748b', fontSize: 13, textAlign: 'center', marginTop: 4 },
-  card: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#1e293b',
-    padding: 14,
-    borderRadius: 12,
-    marginBottom: 10,
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  avatar: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+  emptyContainer: {
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    marginRight: 12,
+    padding: 20,
   },
-  avatarEnrolled: { backgroundColor: '#059669' },
-  avatarUnenrolled: { backgroundColor: '#334155' },
-  avatarText: { color: '#ffffff', fontSize: 18, fontWeight: 'bold' },
-  empName: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
-  empId: { color: '#94a3b8', fontSize: 13, marginTop: 2 },
-  statusRow: { flexDirection: 'row', alignItems: 'center', marginTop: 5, gap: 5 },
-  statusDot: { width: 6, height: 6, borderRadius: 3 },
-  dotGreen: { backgroundColor: '#10b981' },
-  dotAmber: { backgroundColor: '#f59e0b' },
-  statusText: { fontSize: 11, fontWeight: '600' },
-  textGreen: { color: '#10b981' },
-  textAmber: { color: '#f59e0b' },
-  actionBtn: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 },
-  enrollBtn: { backgroundColor: '#2563eb' },
-  enrollBtnText: { color: '#ffffff', fontSize: 13, fontWeight: '700' },
-  updateBtn: { backgroundColor: '#1e293b', borderWidth: 1, borderColor: '#475569' },
-  updateBtnText: { color: '#38bdf8', fontSize: 13, fontWeight: '600' },
+  emptyTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  emptySub: {
+    color: '#64748b',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 6,
+  },
+  listContent: {
+    padding: 16,
+  },
 });
