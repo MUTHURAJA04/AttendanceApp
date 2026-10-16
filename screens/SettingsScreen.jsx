@@ -224,6 +224,20 @@ export default function SettingsScreen() {
               {config.doublePunchLockout || FACE_CONFIG.PUNCH_COOLDOWN_MINUTES} Minutes
             </Text>
           </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Auto-Reset to Camera</Text>
+            <Text style={styles.infoValue}>
+              {config.autoResetSeconds || 60} Seconds
+            </Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.infoRow}>
+            <Text style={styles.infoLabel}>Offline Punches</Text>
+            <Text style={styles.infoValue}>
+              {config.allowOfflinePunches !== false ? 'Cached Locally' : 'Cloud Only'}
+            </Text>
+          </View>
         </View>
 
         {/* 3. TERMINAL & SYSTEM DIAGNOSTICS */}
@@ -246,7 +260,7 @@ export default function SettingsScreen() {
           <View style={styles.divider} />
           <View style={styles.infoRow}>
             <Text style={styles.infoLabel}>Neural Network Architecture</Text>
-            <Text style={styles.infoValue}>MobileFaceNet (128-D Vector)</Text>
+            <Text style={styles.infoValue}>MobileFaceNet (512-D ArcFace Vector)</Text>
           </View>
           <View style={styles.divider} />
           <View style={styles.infoRow}>
@@ -281,7 +295,7 @@ export default function SettingsScreen() {
         overlay
         size="large"
         text="Syncing Staff & Face Embeddings..."
-        subtext="Fetching latest employee profiles and 128D biometric vectors from cloud"
+        subtext="Fetching latest employee profiles and 512-D biometric vectors from cloud"
       />
     )}
   </View>

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   StyleSheet,
   View,
@@ -13,8 +13,10 @@ import {
 import { Camera } from 'react-native-vision-camera-face-detector';
 import { useResizer } from 'react-native-vision-camera-resizer';
 import { useTensorflowModel } from 'react-native-fast-tflite';
+import { NitroModules } from 'react-native-nitro-modules';
 import { scheduleOnRN } from 'react-native-worklets';
-import { EmployeeStorage, ConfigStorage } from '../services/employeeStorage';
+import { EmployeeStorage } from '../services/employeeStorage';
+import { loadKioskSettings } from '../services/kioskSettings';
 import { FACE_CONFIG } from '../constants/faceConfig';
 import { averageEmbeddings, validateFacePose } from '../utils/faceEmbeddingUtils';
 import FaceGuideBox from '../components/FaceGuideBox';
@@ -35,6 +37,10 @@ export default function RegisterFaceModal({
     [],
   );
   const model = modelPlugin.state === 'loaded' ? modelPlugin.model : null;
+  const boxedModel = useMemo(
+    () => (model != null ? NitroModules.box(model) : null),
+    [model],
+  );
 
   const { resizer } = useResizer({
     width: FACE_CONFIG.MODEL_INPUT_WIDTH,
@@ -46,16 +52,16 @@ export default function RegisterFaceModal({
   });
 
   const [samplesCount, setSamplesCount] = useState(0);
-  const [targetSamples, setTargetSamples] = useState(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET);
+  const [targetSamples, setTargetSamples] = useState(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET || 10);
   const [detectionStatus, setDetectionStatus] = useState('Position Face in Box');
   const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'WARNING' | 'MATCH'
   const [hasValidFace, setHasValidFace] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
   // Dynamic configuration refs from DB
-  const targetSamplesRef = useRef(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET);
-  const sampleIntervalMsRef = useRef(FACE_CONFIG.SAMPLE_INTERVAL_MS);
-  const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES);
+  const targetSamplesRef = useRef(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET || 10);
+  const sampleIntervalMsRef = useRef(FACE_CONFIG.SAMPLE_INTERVAL_MS || 200);
+  const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES || 18);
 
   const samplesRef = useRef([]);
   const isCapturingRef = useRef(true);
@@ -69,14 +75,15 @@ export default function RegisterFaceModal({
     }
   }, [hasPermission, requestPermission]);
 
-  // Load latest dynamic settings from DB
+  // Load latest dynamic settings directly from Supabase DB
   useEffect(() => {
     if (visible) {
-      ConfigStorage.getConfig().then((cfg) => {
-        const samples = cfg.enrollmentSamples || FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET;
-        const interval = cfg.sampleIntervalMs || FACE_CONFIG.SAMPLE_INTERVAL_MS;
-        const yaw = cfg.yawAngleTolerance || FACE_CONFIG.MAX_HEAD_YAW_DEGREES;
+      loadKioskSettings().then((cfg) => {
+        const samples = Number(cfg.enrollmentSamples || FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET || 10);
+        const interval = Number(cfg.sampleIntervalMs || FACE_CONFIG.SAMPLE_INTERVAL_MS || 200);
+        const yaw = Number(cfg.yawTolerance || FACE_CONFIG.MAX_HEAD_YAW_DEGREES || 18);
 
+        console.log(`[RegisterFaceModal] Loaded live DB settings: targetSamples=${samples}, interval=${interval}ms, yaw=${yaw}°`);
         setTargetSamples(samples);
         targetSamplesRef.current = samples;
         sampleIntervalMsRef.current = interval;
@@ -101,7 +108,7 @@ export default function RegisterFaceModal({
   }, [visible, modelPlugin.state]);
 
   // ============================================================
-  // SAVE EMBEDDING LOCALLY & TO CLOUD
+  // SAVE 512-D EMBEDDING LOCALLY & TO CLOUD
   // ============================================================
   const handleSaveEnrollment = async (templateVector) => {
     if (!employee?.id) {
@@ -112,9 +119,9 @@ export default function RegisterFaceModal({
 
     try {
       setIsSaving(true);
-      console.log(`[RegisterFaceModal] Saving face embedding locally and to cloud for ${employee.name || employee.full_name}...`);
+      console.log(`[RegisterFaceModal] Saving 512-D face embedding for ${employee.name || employee.full_name}...`);
 
-      // Saves locally to AsyncStorage AND syncs to Supabase
+      // Saves locally to AsyncStorage AND syncs to Supabase employees.face_embedding
       await EmployeeStorage.saveEmployeeFaceCloudAndLocal({
         employee,
         template: templateVector,
@@ -125,7 +132,7 @@ export default function RegisterFaceModal({
 
       Alert.alert(
         'Enrollment Complete! ✓',
-        `Face template saved locally on device and synced for ${employee.name || employee.full_name || 'employee'}.`,
+        `512-D face template saved locally on device and synced for ${employee.name || employee.full_name || 'employee'}.`,
         [
           {
             text: 'Done',
@@ -148,7 +155,7 @@ export default function RegisterFaceModal({
   };
 
   // ============================================================
-  // ML KIT FACE DETECTION GATE
+  // ML KIT FACE DETECTION GATE WITH POSE CHECK (10 FRONTAL FRAMES)
   // ============================================================
   const handleFacesDetected = useCallback((faces) => {
     if (!isCapturingRef.current) {
@@ -157,7 +164,13 @@ export default function RegisterFaceModal({
       return;
     }
 
-    const validation = validateFacePose(faces, yawAngleToleranceRef.current);
+    // Strict pose gates: yaw <= 18, pitch <= 14, roll <= 10, minBoxSize >= 120
+    const validation = validateFacePose(faces, {
+      maxYaw: yawAngleToleranceRef.current || FACE_CONFIG.MAX_HEAD_YAW_DEGREES,
+      maxPitch: FACE_CONFIG.MAX_HEAD_PITCH_DEGREES,
+      maxRoll: FACE_CONFIG.MAX_HEAD_ROLL_DEGREES,
+      minBoxSize: FACE_CONFIG.MIN_FACE_BOX_SIZE,
+    });
 
     if (!validation.isValid) {
       hasValidFaceRef.current = false;
@@ -167,7 +180,7 @@ export default function RegisterFaceModal({
       return;
     }
 
-    // Valid single face detected
+    // Valid frontal single face detected
     lastValidFaceTimeRef.current = Date.now();
     hasValidFaceRef.current = true;
     setHasValidFace(true);
@@ -176,7 +189,7 @@ export default function RegisterFaceModal({
   }, []);
 
   // ============================================================
-  // WORKLET RECEIVER & VECTOR AVERAGING
+  // WORKLET RECEIVER & 512-D VECTOR AVERAGING
   // ============================================================
   const handleEmbeddingFromWorklet = (rawArr) => {
     const isRecentlyValid =
@@ -199,10 +212,10 @@ export default function RegisterFaceModal({
       isCapturingRef.current = false;
       hasValidFaceRef.current = false;
 
-      // Element-wise averaging and unit normalization
+      // Element-wise averaging and unit normalization across all 512 dimensions
       const finalTemplate = averageEmbeddings(
         samplesRef.current,
-        FACE_CONFIG.EMBEDDING_SIZE,
+        512,
       );
 
       handleSaveEnrollment(finalTemplate);
@@ -214,7 +227,13 @@ export default function RegisterFaceModal({
     onFrame(frame) {
       'worklet';
 
-      if (model == null || resizer == null) {
+      if (boxedModel == null || resizer == null) {
+        frame.dispose();
+        return;
+      }
+
+      const activeModel = boxedModel.unbox();
+      if (activeModel == null) {
         frame.dispose();
         return;
       }
@@ -224,8 +243,8 @@ export default function RegisterFaceModal({
         try {
           const buffer = resized.getPixelBuffer();
           const modelInputs =
-            model.inputs.length === 2 ? [buffer, buffer] : [buffer];
-          const outputs = model.runSync(modelInputs);
+            activeModel.inputs.length === 2 ? [buffer, buffer] : [buffer];
+          const outputs = activeModel.runSync(modelInputs);
 
           if (!outputs || outputs.length === 0) return;
 
@@ -238,7 +257,7 @@ export default function RegisterFaceModal({
           }
 
           const rawMagnitude = Math.sqrt(sumSquares);
-          const safeMagnitude = Math.max(rawMagnitude, FACE_CONFIG.NORMALIZATION_EPSILON);
+          const safeMagnitude = Math.max(rawMagnitude, FACE_CONFIG.NORMALIZATION_EPSILON || 1e-12);
 
           const rawArr = new Array(FACE_CONFIG.EMBEDDING_SIZE);
           for (let i = 0; i < FACE_CONFIG.EMBEDDING_SIZE; i++) {
@@ -277,19 +296,19 @@ export default function RegisterFaceModal({
           />
         )}
 
-        {/* Loading Indicator for Model Initialization */}
-        {modelPlugin.state === 'loading' && (
-          <View style={styles.loadingBanner}>
-            <SimpleLoading size="small" text="Initializing Face AI Engine..." />
-          </View>
-        )}
-
-        {/* Reusable Guide Frame Overlay */}
+        {/* Reusable Guide Frame Overlay & Status Pill */}
         <FaceGuideBox
-          boxState={boxState}
-          promptText={isSaving ? 'Saving Face Template...' : detectionStatus}
+          boxState={modelPlugin.state === 'loading' ? 'DEFAULT' : boxState}
+          promptText={
+            modelPlugin.state === 'loading'
+              ? 'Initializing Face AI Engine...'
+              : isSaving
+              ? 'Saving Face Template...'
+              : detectionStatus
+          }
           subText={`Look straight into camera to capture ${targetSamples} verified angles`}
           isIdentified={hasValidFace}
+          isLoading={modelPlugin.state === 'loading'}
         />
 
         {/* Reusable Bottom Progress Card */}
@@ -307,7 +326,7 @@ export default function RegisterFaceModal({
             overlay
             size="medium"
             text="Saving Face Template..."
-            subtext="Averaging 128D facial vectors & saving to local biometric vault"
+            subtext="Averaging 512-D facial vectors & saving to local biometric vault"
           />
         )}
       </View>
@@ -319,25 +338,5 @@ const styles = StyleSheet.create({
   modalContainer: {
     flex: 1,
     backgroundColor: '#000000',
-  },
-  loadingBanner: {
-    position: 'absolute',
-    top: 50,
-    alignSelf: 'center',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    backgroundColor: 'rgba(15, 23, 42, 0.92)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: '#38bdf8',
-    zIndex: 20,
-  },
-  loadingText: {
-    color: '#38bdf8',
-    fontSize: 13,
-    fontWeight: '600',
   },
 });

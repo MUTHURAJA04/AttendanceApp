@@ -1,5 +1,5 @@
 import React from 'react';
-import { StyleSheet, View, Text, useWindowDimensions } from 'react-native';
+import { StyleSheet, View, Text, ActivityIndicator, useWindowDimensions } from 'react-native';
 
 /**
  * Reusable Face Alignment Guide Box with dynamic border states and guidance pill
@@ -8,12 +8,14 @@ import { StyleSheet, View, Text, useWindowDimensions } from 'react-native';
  * @param {string} props.promptText
  * @param {string} [props.subText]
  * @param {boolean} [props.isIdentified]
+ * @param {boolean} [props.isLoading]
  */
 export default function FaceGuideBox({
   boxState = 'DEFAULT',
   promptText = 'Position Face in Box',
   subText = 'Keep face steady inside frame',
   isIdentified = false,
+  isLoading = false,
 }) {
   const { width: screenWidth, height: screenHeight } = useWindowDimensions();
   const boxSize = Math.floor(screenWidth * 0.72);
@@ -54,7 +56,10 @@ export default function FaceGuideBox({
     <>
       {/* Floating Status / Guidance Pill at Top */}
       <View style={styles.pillContainer} pointerEvents="none">
-        <View style={[styles.pill, getPillStyle()]}>
+        <View style={[styles.pill, getPillStyle(), styles.pillRow]}>
+          {isLoading && (
+            <ActivityIndicator size="small" color="#38bdf8" style={styles.pillSpinner} />
+          )}
           <Text style={styles.pillText}>{promptText}</Text>
         </View>
       </View>
@@ -97,6 +102,14 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
     shadowRadius: 5,
+  },
+  pillRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pillSpinner: {
+    marginRight: 8,
   },
   pillDefault: {
     backgroundColor: 'rgba(15, 23, 42, 0.90)',

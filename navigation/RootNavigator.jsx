@@ -12,6 +12,7 @@ import AttendanceScreen from '../screens/AttendanceScreen';
 import EmployeesScreen from '../screens/EmployeesScreen';
 import HistoryScreen from '../screens/HistoryScreen';
 import SettingsScreen from '../screens/SettingsScreen';
+import { loadKioskSettings, subscribeToLiveSettings } from '../services/kioskSettings';
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
@@ -23,9 +24,53 @@ const renderTabIcon = (routeName, color, size = 22) => {
   return <ScanFace color={color} size={size} />;
 };
 
-function MainTabs() {
+function MainTabs({ navigation }) {
+  const resetTimerRef = React.useRef(null);
+  const timeoutSecondsRef = React.useRef(60);
+
+  React.useEffect(() => {
+    loadKioskSettings().then((cfg) => {
+      if (cfg?.autoResetSeconds) {
+        timeoutSecondsRef.current = Number(cfg.autoResetSeconds);
+      }
+    });
+
+    const sub = subscribeToLiveSettings((updated) => {
+      if (updated?.autoResetSeconds) {
+        timeoutSecondsRef.current = Number(updated.autoResetSeconds);
+      }
+    });
+
+    return () => {
+      if (sub?.unsubscribe) sub.unsubscribe();
+      if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+    };
+  }, []);
+
+  const handleStateChange = (state) => {
+    if (!state) return;
+    const currentRoute = state.routes[state.index];
+
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+
+    // If screen is not Kiosk (e.g. Employees, History, Settings), start auto-reset countdown
+    if (currentRoute && currentRoute.name !== 'Kiosk') {
+      const ms = (timeoutSecondsRef.current || 60) * 1000;
+      resetTimerRef.current = setTimeout(() => {
+        console.log(`[Kiosk Inactivity] Screen reset timeout (${timeoutSecondsRef.current}s). Navigating back to Kiosk camera.`);
+        navigation.navigate('Kiosk');
+      }, ms);
+    }
+  };
+
   return (
     <Tab.Navigator
+      screenListeners={{
+        state: (e) => handleStateChange(e.data?.state),
+      }}
       screenOptions={({ route }) => ({
         headerShown: false,
         tabBarStyle: styles.tabBar,

@@ -54,6 +54,7 @@ export const loadKioskSettings = async () => {
         sampleIntervalMs: cached.sampleIntervalMs ?? FACE_CONFIG.SAMPLE_INTERVAL_MS,
         sessionVersion: cached.sessionVersion ?? 1,
         allowOfflinePunches: cached.allowOfflinePunches ?? true,
+        autoResetSeconds: cached.autoResetSeconds ?? 60,
       };
     }
 
@@ -72,6 +73,7 @@ export const loadKioskSettings = async () => {
       sampleIntervalMs: config.sample_interval_ms ?? config.sampleIntervalMs ?? cached.sampleIntervalMs ?? FACE_CONFIG.SAMPLE_INTERVAL_MS,
       sessionVersion: Number(config.kiosk_session_version ?? config.sessionVersion ?? cached.sessionVersion ?? 1),
       allowOfflinePunches: config.allow_offline_punches ?? cached.allowOfflinePunches ?? true,
+      autoResetSeconds: Number(config.kiosk_auto_lock_seconds ?? config.autoResetSeconds ?? cached.autoResetSeconds ?? 60),
       lastSynced: new Date().toISOString(),
     };
 
@@ -91,6 +93,7 @@ export const loadKioskSettings = async () => {
       sampleIntervalMs: cached.sampleIntervalMs ?? FACE_CONFIG.SAMPLE_INTERVAL_MS,
       sessionVersion: cached.sessionVersion ?? 1,
       allowOfflinePunches: cached.allowOfflinePunches ?? true,
+      autoResetSeconds: cached.autoResetSeconds ?? 60,
       lastSynced: cached.lastSynced || null,
     };
   }
@@ -102,8 +105,9 @@ export const loadKioskSettings = async () => {
  * @param {() => void} onLogoutRequired
  */
 export const listenForRemoteLogout = (currentSessionVersion, onLogoutRequired) => {
-  return supabase
-    .channel('kiosk_security')
+  const channelName = `kiosk_security_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const channel = supabase
+    .channel(channelName)
     .on(
       'postgres_changes',
       {
@@ -123,6 +127,13 @@ export const listenForRemoteLogout = (currentSessionVersion, onLogoutRequired) =
       },
     )
     .subscribe();
+
+  return {
+    channel,
+    unsubscribe: () => {
+      supabase.removeChannel(channel);
+    },
+  };
 };
 
 /**
@@ -130,8 +141,9 @@ export const listenForRemoteLogout = (currentSessionVersion, onLogoutRequired) =
  * @param {(newSettings: object) => void} onSettingsChanged
  */
 export const subscribeToLiveSettings = (onSettingsChanged) => {
-  return supabase
-    .channel('kiosk_settings_live')
+  const channelName = `kiosk_settings_live_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const channel = supabase
+    .channel(channelName)
     .on(
       'postgres_changes',
       {
@@ -146,4 +158,12 @@ export const subscribeToLiveSettings = (onSettingsChanged) => {
       },
     )
     .subscribe();
+
+  return {
+    channel,
+    unsubscribe: () => {
+      supabase.removeChannel(channel);
+    },
+  };
 };
+

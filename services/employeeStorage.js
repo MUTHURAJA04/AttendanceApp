@@ -15,7 +15,7 @@ function formatEmployeeData(emp) {
 
   const rawTemplate = emp.template || emp.face_embedding || null;
   const templateArray = Array.isArray(rawTemplate) && rawTemplate.length > 0 ? Array.from(rawTemplate) : null;
-  const hasFace = templateArray !== null && templateArray.length >= (FACE_CONFIG.EMBEDDING_SIZE || 128);
+  const hasFace = templateArray !== null && templateArray.length >= (FACE_CONFIG.EMBEDDING_SIZE || 512);
 
   return {
     id: String(emp.id),
@@ -118,7 +118,7 @@ export const EmployeeStorage = {
    * Complete Enrollment Flow: Save face embedding locally AND update Supabase database
    * @param {object} params
    * @param {object} params.employee
-   * @param {Array<number>} params.template - 128-D vector
+   * @param {Array<number>} params.template - 512-D vector
    * @returns {Promise<object>}
    */
   async saveEmployeeFaceCloudAndLocal({ employee, template }) {
@@ -309,6 +309,7 @@ export const EmployeeStorage = {
         score: Number(similarityScore || 0),
         similarityScore: Number(similarityScore || 0),
         type: punchType,
+        synced: false,
       };
 
       logs.unshift(newPunch);
@@ -333,7 +334,7 @@ export const EmployeeStorage = {
   async _syncPunchToCloud(punch) {
     try {
       const nowIso = punch.timestamp;
-      const todayStart = new Date();
+      const todayStart = new Date(nowIso);
       todayStart.setHours(0, 0, 0, 0);
 
       // If branchId is not in punch object, resolve it from local employee record
@@ -365,6 +366,7 @@ export const EmployeeStorage = {
             })
             .eq('id', openLogs[0].id);
 
+          await this._markPunchSyncedLocally(punch.id);
           console.log(`[EmployeeStorage] Cloud attendance_logs check_out updated for ${punch.employeeName}`);
           return;
         }
@@ -389,12 +391,42 @@ export const EmployeeStorage = {
       ]);
 
       if (logError) {
-        console.warn('[EmployeeStorage] attendance_logs insert error:', logError.message);
+        console.warn('[EmployeeStorage] attendance_logs insert error (cached offline):', logError.message);
       } else {
+        await this._markPunchSyncedLocally(punch.id);
         console.log(`[EmployeeStorage] ✓ Cloud DB updated: ${punch.employeeName} marked PRESENT (${punch.type})`);
       }
     } catch (err) {
-      console.warn('[EmployeeStorage] Cloud attendance sync failed (saved locally):', err?.message || err);
+      console.warn('[EmployeeStorage] Cloud attendance sync failed (cached offline):', err?.message || err);
+    }
+  },
+
+  async _markPunchSyncedLocally(punchId) {
+    try {
+      const logs = await this.getAttendanceLogs();
+      const updated = logs.map(l => (String(l.id) === String(punchId) ? { ...l, synced: true } : l));
+      await AsyncStorage.setItem(ATTENDANCE_LOGS_KEY, JSON.stringify(updated));
+    } catch {
+      // Non-blocking
+    }
+  },
+
+  /**
+   * Syncs any locally cached offline punches that failed to upload when device had no network
+   */
+  async syncPendingOfflinePunches() {
+    try {
+      const logs = await this.getAttendanceLogs();
+      const unsynced = logs.filter(l => l && !l.synced);
+      if (unsynced.length === 0) return 0;
+      console.log(`[EmployeeStorage] Found ${unsynced.length} offline punches to sync...`);
+      for (const p of unsynced) {
+        await this._syncPunchToCloud(p);
+      }
+      return unsynced.length;
+    } catch (e) {
+      console.warn('[EmployeeStorage] Offline punch queue sync exception:', e);
+      return 0;
     }
   },
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { StyleSheet, Text, View, Vibration } from 'react-native';
 import {
   useCameraDevice,
@@ -8,6 +8,7 @@ import {
 import { Camera } from 'react-native-vision-camera-face-detector';
 import { useResizer } from 'react-native-vision-camera-resizer';
 import { useTensorflowModel } from 'react-native-fast-tflite';
+import { NitroModules } from 'react-native-nitro-modules';
 import { scheduleOnRN } from 'react-native-worklets';
 import { useIsFocused } from '@react-navigation/native';
 import Sound from 'react-native-sound';
@@ -36,6 +37,10 @@ export default function AttendanceScreen() {
     [],
   );
   const model = modelPlugin.state === 'loaded' ? modelPlugin.model : null;
+  const boxedModel = useMemo(
+    () => (model != null ? NitroModules.box(model) : null),
+    [model],
+  );
 
   const { resizer } = useResizer({
     width: FACE_CONFIG.MODEL_INPUT_WIDTH,
@@ -67,6 +72,7 @@ export default function AttendanceScreen() {
   const cooldownMinutesRef = useRef(FACE_CONFIG.PUNCH_COOLDOWN_MINUTES);
   const sessionVersionRef = useRef(1);
   const consecutiveMatchRef = useRef({ id: null, count: 0 });
+  const lastCandidateRef = useRef({ id: null, timestamp: 0, count: 0, match: null, score: 0 });
   const triggerPunchRef = useRef(null);
   const employeePunchStateRef = useRef(new Map()); // Map of employeeId -> 'IN' | 'OUT'
 
@@ -205,6 +211,7 @@ export default function AttendanceScreen() {
     setPunchSuccess(null);
     setDuplicateWarning(null);
     consecutiveMatchRef.current = { id: null, count: 0 };
+    lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
     eyesWereClosed.current = false;
     closedFrameCount.current = 0;
     openFrameCount.current = 0;
@@ -216,6 +223,23 @@ export default function AttendanceScreen() {
   // ============================================================
   const triggerAttendancePunch = async (employee, score) => {
     if (isCooldownRef.current) return;
+
+    // Strict 2-frame consensus gate: 2 consecutive frames within 400ms with similarity >= live threshold
+    const candidate = lastCandidateRef.current;
+    const now = Date.now();
+    const requiredThreshold = thresholdRef.current || FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD;
+    const isConsensusValid =
+      candidate.id &&
+      String(candidate.id) === String(employee.id) &&
+      candidate.count >= 2 &&
+      (now - candidate.timestamp) <= 400 &&
+      score >= requiredThreshold;
+
+    if (!isConsensusValid) {
+      console.warn('[Attendance] Blocked punch: 2-frame consensus not verified within 400ms');
+      return;
+    }
+
     isCooldownRef.current = true;
 
     // 1. Record punch in storage (evaluates duplicate lockout & alternates strictly IN -> OUT -> IN)
@@ -295,7 +319,12 @@ export default function AttendanceScreen() {
     (faces) => {
       if (isCooldownRef.current || !isFocused) return;
 
-      const validation = validateFacePose(faces, yawAngleToleranceRef.current);
+      const validation = validateFacePose(faces, {
+        maxYaw: yawAngleToleranceRef.current || FACE_CONFIG.MAX_HEAD_YAW_DEGREES,
+        maxPitch: FACE_CONFIG.MAX_HEAD_PITCH_DEGREES,
+        maxRoll: FACE_CONFIG.MAX_HEAD_ROLL_DEGREES,
+        minBoxSize: FACE_CONFIG.MIN_FACE_BOX_SIZE,
+      });
 
       if (!validation.isValid) {
         setBoxState(validation.status === 'NO_FACE' ? 'DEFAULT' : 'WARNING');
@@ -368,11 +397,22 @@ export default function AttendanceScreen() {
           eyesWereClosed.current = false;
           blinkCooldown.current = true;
 
-          // If face is identified when blink completes -> Stamp attendance
-          if (currentMatchedEmp && triggerPunchRef.current) {
+          // If face is identified with 2-frame consensus within 400ms when blink completes -> Stamp attendance
+          const candidate = lastCandidateRef.current;
+          const now = Date.now();
+          const requiredThreshold = thresholdRef.current || FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD;
+          const hasConsensus =
+            candidate.id != null &&
+            candidate.count >= 2 &&
+            (now - candidate.timestamp) <= 400 &&
+            candidate.score >= requiredThreshold;
+
+          const targetEmp = hasConsensus ? candidate.match : currentMatchedEmp;
+
+          if (targetEmp && hasConsensus && triggerPunchRef.current) {
             triggerPunchRef.current(
-              currentMatchedEmp,
-              liveSimilarityRef.current,
+              targetEmp,
+              candidate.score || liveSimilarityRef.current,
             );
           } else {
             setPromptText('Blink Verified. Face Unrecognized');
@@ -388,7 +428,7 @@ export default function AttendanceScreen() {
   );
 
   // ============================================================
-  // PHASE 2: CONTINUOUS 1:N RECOGNITION (MobileFaceNet Embedding)
+  // PHASE 2: CONTINUOUS 1:N RECOGNITION (MobileFaceNet 512-D Embedding)
   // ============================================================
   const handleEmbeddingFromWorklet = (embeddingArray) => {
     if (isCooldownRef.current || !isFocused) return;
@@ -397,43 +437,68 @@ export default function AttendanceScreen() {
     if (!currentList || currentList.length === 0) {
       setActiveMatch(null);
       activeMatchRef.current = null;
+      lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
       setLiveSimilarity(0);
       liveSimilarityRef.current = 0;
       return;
     }
 
-    // Fast 1:N vector cosine similarity verification with margin check
+    const currentThreshold = thresholdRef.current || FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD;
+
+    // Fast 1:N vector cosine similarity verification with margin check (using live threshold from DB)
     const { bestMatch, similarityScore, isMatch, isAmbiguous } = findBestFaceMatch(
       embeddingArray,
       currentList,
-      thresholdRef.current,
-      FACE_CONFIG.MIN_MATCH_MARGIN,
+      currentThreshold,
+      FACE_CONFIG.MIN_MATCH_MARGIN || 0.08,
     );
 
     liveSimilarityRef.current = similarityScore;
     setLiveSimilarity(similarityScore);
 
-    if (isMatch && bestMatch != null) {
-      if (consecutiveMatchRef.current.id === bestMatch.id) {
-        consecutiveMatchRef.current.count += 1;
-      } else {
-        consecutiveMatchRef.current = { id: bestMatch.id, count: 1 };
-      }
+    const now = Date.now();
 
-      // Require at least CONSECUTIVE_MATCH_FRAMES (2) consecutive confirmations
-      if (consecutiveMatchRef.current.count >= (FACE_CONFIG.CONSECUTIVE_MATCH_FRAMES || 2)) {
-        setActiveMatch(bestMatch);
-        activeMatchRef.current = bestMatch;
+    // 2-frame consensus voting logic:
+    // Only confirm identification if two consecutive frames within 400ms identify the exact same employee ID with similarity >= currentThreshold
+    if (isMatch && bestMatch != null && similarityScore >= currentThreshold) {
+      const prev = lastCandidateRef.current;
+      const isSameCandidate = prev.id === bestMatch.id;
+      const isWithin400ms = (now - prev.timestamp) <= 400;
 
-        // If Liveness is turned off, punch immediately without waiting for blink
-        if (!livenessEnabledRef.current && triggerPunchRef.current) {
-          triggerPunchRef.current(bestMatch, similarityScore);
+      if (isSameCandidate && isWithin400ms) {
+        const newCount = prev.count + 1;
+        lastCandidateRef.current = {
+          id: bestMatch.id,
+          timestamp: now,
+          count: newCount,
+          match: bestMatch,
+          score: similarityScore,
+        };
+
+        if (newCount >= 2) {
+          setActiveMatch(bestMatch);
+          activeMatchRef.current = bestMatch;
+
+          // If Liveness (blink) is turned off, punch immediately upon 2-frame consensus
+          if (!livenessEnabledRef.current && triggerPunchRef.current) {
+            triggerPunchRef.current(bestMatch, similarityScore);
+          }
         }
+      } else {
+        lastCandidateRef.current = {
+          id: bestMatch.id,
+          timestamp: now,
+          count: 1,
+          match: bestMatch,
+          score: similarityScore,
+        };
       }
     } else {
-      consecutiveMatchRef.current = { id: null, count: 0 };
-      setActiveMatch(null);
-      activeMatchRef.current = null;
+      if (now - lastCandidateRef.current.timestamp > 400) {
+        lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
+        setActiveMatch(null);
+        activeMatchRef.current = null;
+      }
       if (isAmbiguous) {
         setPromptText('Multiple Similar Faces - Align Steadily');
       }
@@ -441,14 +506,20 @@ export default function AttendanceScreen() {
   };
 
   // ============================================================
-  // WORKLET PIPELINE (Camera Frames -> TFLite -> Embeddings)
+  // WORKLET PIPELINE (Camera Frames -> TFLite -> 512-D Embeddings)
   // ============================================================
   const frameOutput = useFrameOutput({
     pixelFormat: 'yuv',
     onFrame(frame) {
       'worklet';
 
-      if (model == null || resizer == null) {
+      if (boxedModel == null || resizer == null) {
+        frame.dispose();
+        return;
+      }
+
+      const activeModel = boxedModel.unbox();
+      if (activeModel == null) {
         frame.dispose();
         return;
       }
@@ -459,8 +530,8 @@ export default function AttendanceScreen() {
         try {
           const buffer = resized.getPixelBuffer();
           const modelInputs =
-            model.inputs.length === 2 ? [buffer, buffer] : [buffer];
-          const outputs = model.runSync(modelInputs);
+            activeModel.inputs.length === 2 ? [buffer, buffer] : [buffer];
+          const outputs = activeModel.runSync(modelInputs);
           if (!outputs || outputs.length === 0) return;
 
           const output = new Float32Array(outputs[0]);
@@ -472,7 +543,7 @@ export default function AttendanceScreen() {
           }
 
           const rawMagnitude = Math.sqrt(sumSquares);
-          const safeMagnitude = Math.max(rawMagnitude, FACE_CONFIG.NORMALIZATION_EPSILON);
+          const safeMagnitude = Math.max(rawMagnitude, FACE_CONFIG.NORMALIZATION_EPSILON || 1e-12);
 
           const rawArr = new Array(FACE_CONFIG.EMBEDDING_SIZE);
           for (let i = 0; i < FACE_CONFIG.EMBEDDING_SIZE; i++) {
