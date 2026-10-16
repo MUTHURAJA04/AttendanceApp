@@ -1,5 +1,6 @@
 import React from 'react';
 import { StyleSheet, View, Text, TouchableOpacity } from 'react-native';
+import { UserCheck, UserPlus, CheckCircle2, AlertCircle } from 'lucide-react-native';
 
 /**
  * Reusable Employee Item Card for Staff Directory
@@ -29,7 +30,11 @@ export default function EmployeeItemCard({ employee, onEnrollPress }) {
 
         {/* Status indicator */}
         <View style={styles.statusRow}>
-          <View style={[styles.statusDot, hasFace ? styles.dotGreen : styles.dotAmber]} />
+          {hasFace ? (
+            <CheckCircle2 size={13} color="#10b981" />
+          ) : (
+            <AlertCircle size={13} color="#f59e0b" />
+          )}
           <Text style={[styles.statusText, hasFace ? styles.textGreen : styles.textAmber]}>
             {hasFace ? 'Face Enrolled (Local & Cloud)' : 'No Face Registered'}
           </Text>
@@ -41,9 +46,16 @@ export default function EmployeeItemCard({ employee, onEnrollPress }) {
         style={[styles.actionBtn, hasFace ? styles.updateBtn : styles.enrollBtn]}
         onPress={onEnrollPress}
         activeOpacity={0.75}>
-        <Text style={[styles.actionBtnText, hasFace ? styles.updateBtnText : styles.enrollBtnText]}>
-          {hasFace ? 'Update' : '+ Enroll'}
-        </Text>
+        <View style={styles.btnContent}>
+          {hasFace ? (
+            <UserCheck size={14} color="#38bdf8" />
+          ) : (
+            <UserPlus size={14} color="#ffffff" />
+          )}
+          <Text style={[styles.actionBtnText, hasFace ? styles.updateBtnText : styles.enrollBtnText]}>
+            {hasFace ? 'Update' : 'Enroll'}
+          </Text>
+        </View>
       </TouchableOpacity>
     </View>
   );
@@ -121,9 +133,14 @@ const styles = StyleSheet.create({
     color: '#f59e0b',
   },
   actionBtn: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 8,
+  },
+  btnContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
   },
   enrollBtn: {
     backgroundColor: '#2563eb',

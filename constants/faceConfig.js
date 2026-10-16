@@ -14,7 +14,9 @@ export const FACE_CONFIG = {
   NORMALIZATION_EPSILON: 1e-12,
 
   // Recognition & Verification
-  DEFAULT_SIMILARITY_THRESHOLD: 0.70,
+  DEFAULT_SIMILARITY_THRESHOLD: 0.80,
+  MIN_MATCH_MARGIN: 0.05,
+  CONSECUTIVE_MATCH_FRAMES: 2,
   
   // Enrollment settings
   ENROLLMENT_SAMPLE_TARGET: 10,
@@ -23,7 +25,7 @@ export const FACE_CONFIG = {
   // Liveness (Blink) thresholds
   EYE_CLOSED_THRESHOLD: 0.25,
   EYE_OPEN_THRESHOLD: 0.65,
-  MAX_HEAD_YAW_DEGREES: 18,
+  MAX_HEAD_YAW_DEGREES: 25,
 
   // Lockout / Debounce timing
   PUNCH_COOLDOWN_MINUTES: 2,

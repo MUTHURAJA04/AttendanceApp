@@ -74,19 +74,37 @@ export function averageEmbeddings(samples, embeddingSize = FACE_CONFIG.EMBEDDING
 
 /**
  * Fast 1:N Face Search & Verification against locally enrolled employee database.
+ * Requires both minimum threshold AND a confidence margin above the 2nd best match
+ * to prevent misidentifying Person A as Person B.
+ * 
  * @param {Float32Array | number[]} liveVector - Live normalized embedding from camera
  * @param {Array} employeeList - List of employees with valid template
- * @param {number} threshold - Match threshold (e.g. 0.70)
- * @returns {{ bestMatch: object | null, similarityScore: number, isMatch: boolean }}
+ * @param {number} threshold - Match threshold (e.g. 0.80)
+ * @param {number} minMargin - Required margin between #1 and #2 candidate (e.g. 0.05)
+ * @returns {{ bestMatch: object | null, candidateMatch: object | null, similarityScore: number, secondScore: number, isMatch: boolean, isAmbiguous: boolean }}
  */
-export function findBestFaceMatch(liveVector, employeeList, threshold = FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD) {
+export function findBestFaceMatch(
+  liveVector,
+  employeeList,
+  threshold = FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD,
+  minMargin = FACE_CONFIG.MIN_MATCH_MARGIN || 0.05,
+) {
   if (!liveVector || !employeeList || employeeList.length === 0) {
-    return { bestMatch: null, similarityScore: 0, isMatch: false };
+    return {
+      bestMatch: null,
+      candidateMatch: null,
+      similarityScore: 0,
+      secondScore: 0,
+      isMatch: false,
+      isAmbiguous: false,
+    };
   }
 
   const vecLen = liveVector.length;
   let bestMatch = null;
   let highestScore = -1;
+  let secondMatch = null;
+  let secondHighestScore = -1;
 
   for (let i = 0; i < employeeList.length; i++) {
     const emp = employeeList[i];
@@ -99,18 +117,38 @@ export function findBestFaceMatch(liveVector, employeeList, threshold = FACE_CON
     }
 
     if (dot > highestScore) {
+      secondHighestScore = highestScore;
+      secondMatch = bestMatch;
       highestScore = dot;
       bestMatch = emp;
+    } else if (dot > secondHighestScore) {
+      secondHighestScore = dot;
+      secondMatch = emp;
     }
   }
 
-  const isMatch = highestScore >= threshold && bestMatch !== null;
+  const meetsThreshold = highestScore >= threshold && bestMatch !== null;
+
+  // Margin check: If there are multiple enrolled profiles, the top match must be distinctly
+  // higher than the 2nd best match to avoid confusing two similar faces in the same lighting.
+  let isAmbiguous = false;
+  if (meetsThreshold && employeeList.length > 1 && secondHighestScore > 0) {
+    const margin = highestScore - secondHighestScore;
+    if (margin < minMargin) {
+      isAmbiguous = true;
+    }
+  }
+
+  const isMatch = meetsThreshold && !isAmbiguous;
 
   return {
     bestMatch: isMatch ? bestMatch : null,
-    candidateMatch: bestMatch, // Available for debug or near-match display
+    candidateMatch: bestMatch,
     similarityScore: Math.max(0, highestScore),
+    secondScore: Math.max(0, secondHighestScore),
+    secondMatch,
     isMatch,
+    isAmbiguous,
   };
 }
 
@@ -118,7 +156,7 @@ export function findBestFaceMatch(liveVector, employeeList, threshold = FACE_CON
  * Validates face bounding, presence and orientation
  * @param {Array} faces - Faces array from MLKit face detector
  * @param {number} maxYaw - Maximum allowed head rotation angle
- * @returns {{ isValid: boolean, status: string, face: object | null }}
+ * @returns {{ isValid: boolean, status: string, message: string, face: object | null }}
  */
 export function validateFacePose(faces, maxYaw = FACE_CONFIG.MAX_HEAD_YAW_DEGREES) {
   if (!Array.isArray(faces) || faces.length === 0) {
@@ -135,6 +173,11 @@ export function validateFacePose(faces, maxYaw = FACE_CONFIG.MAX_HEAD_YAW_DEGREE
   if (Math.abs(yaw) > maxYaw) {
     const dir = yaw > maxYaw ? 'Left' : 'Right';
     return { isValid: false, status: 'HEAD_TURNED', message: `Turn ${dir} toward Camera`, face };
+  }
+
+  // Ensure face is reasonably close to the camera if bounding box is provided
+  if (face.bounds && (face.bounds.width < 50 || face.bounds.height < 50)) {
+    return { isValid: false, status: 'TOO_FAR', message: 'Move Closer to Camera', face };
   }
 
   return { isValid: true, status: 'VALID_FACE', message: 'Face Detected', face };

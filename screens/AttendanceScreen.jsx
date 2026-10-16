@@ -11,6 +11,7 @@ import { useTensorflowModel } from 'react-native-fast-tflite';
 import { scheduleOnRN } from 'react-native-worklets';
 import { useIsFocused } from '@react-navigation/native';
 import Sound from 'react-native-sound';
+import { Users, UserCheck, ScanFace, Camera as CameraIcon } from 'lucide-react-native';
 
 import { EmployeeStorage } from '../services/employeeStorage';
 import {
@@ -22,6 +23,7 @@ import { FACE_CONFIG } from '../constants/faceConfig';
 import { findBestFaceMatch, validateFacePose } from '../utils/faceEmbeddingUtils';
 import FaceGuideBox from '../components/FaceGuideBox';
 import AttendanceResultModal from '../components/AttendanceResultModal';
+import SimpleLoading from '../components/SimpleLoading';
 
 export default function AttendanceScreen() {
   const isFocused = useIsFocused();
@@ -64,6 +66,7 @@ export default function AttendanceScreen() {
   const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES);
   const cooldownMinutesRef = useRef(FACE_CONFIG.PUNCH_COOLDOWN_MINUTES);
   const sessionVersionRef = useRef(1);
+  const consecutiveMatchRef = useRef({ id: null, count: 0 });
   const triggerPunchRef = useRef(null);
   const employeePunchStateRef = useRef(new Map()); // Map of employeeId -> 'IN' | 'OUT'
 
@@ -201,6 +204,7 @@ export default function AttendanceScreen() {
     setPromptText('Position Face in Box');
     setPunchSuccess(null);
     setDuplicateWarning(null);
+    consecutiveMatchRef.current = { id: null, count: 0 };
     eyesWereClosed.current = false;
     closedFrameCount.current = 0;
     openFrameCount.current = 0;
@@ -398,27 +402,41 @@ export default function AttendanceScreen() {
       return;
     }
 
-    // Fast 1:N vector cosine similarity verification
-    const { bestMatch, similarityScore, isMatch } = findBestFaceMatch(
+    // Fast 1:N vector cosine similarity verification with margin check
+    const { bestMatch, similarityScore, isMatch, isAmbiguous } = findBestFaceMatch(
       embeddingArray,
       currentList,
       thresholdRef.current,
+      FACE_CONFIG.MIN_MATCH_MARGIN,
     );
 
     liveSimilarityRef.current = similarityScore;
     setLiveSimilarity(similarityScore);
 
     if (isMatch && bestMatch != null) {
-      setActiveMatch(bestMatch);
-      activeMatchRef.current = bestMatch;
+      if (consecutiveMatchRef.current.id === bestMatch.id) {
+        consecutiveMatchRef.current.count += 1;
+      } else {
+        consecutiveMatchRef.current = { id: bestMatch.id, count: 1 };
+      }
 
-      // If Liveness is turned off, punch immediately without waiting for blink
-      if (!livenessEnabledRef.current && triggerPunchRef.current) {
-        triggerPunchRef.current(bestMatch, similarityScore);
+      // Require at least CONSECUTIVE_MATCH_FRAMES (2) consecutive confirmations
+      if (consecutiveMatchRef.current.count >= (FACE_CONFIG.CONSECUTIVE_MATCH_FRAMES || 2)) {
+        setActiveMatch(bestMatch);
+        activeMatchRef.current = bestMatch;
+
+        // If Liveness is turned off, punch immediately without waiting for blink
+        if (!livenessEnabledRef.current && triggerPunchRef.current) {
+          triggerPunchRef.current(bestMatch, similarityScore);
+        }
       }
     } else {
+      consecutiveMatchRef.current = { id: null, count: 0 };
       setActiveMatch(null);
       activeMatchRef.current = null;
+      if (isAmbiguous) {
+        setPromptText('Multiple Similar Faces - Align Steadily');
+      }
     }
   };
 
@@ -476,7 +494,16 @@ export default function AttendanceScreen() {
   if (!hasPermission || !device) {
     return (
       <View style={styles.center}>
-        <Text style={styles.text}>Camera permission required</Text>
+        <CameraIcon size={46} color="#475569" style={{ marginBottom: 14 }} />
+        <SimpleLoading
+          size="medium"
+          text={!hasPermission ? 'Camera Permission Required' : 'Initializing Biometric Sensor...'}
+          subtext={
+            !hasPermission
+              ? 'Please grant camera access to use kiosk attendance'
+              : 'Warming up front camera & face recognition engine'
+          }
+        />
       </View>
     );
   }
@@ -513,7 +540,10 @@ export default function AttendanceScreen() {
       <View style={styles.overlay}>
         <View style={styles.headerRow}>
           <Text style={styles.title}>Attendance Kiosk</Text>
-          <Text style={styles.employeeBadge}>{employees.length} Enrolled</Text>
+          <View style={styles.employeeBadgeRow}>
+            <Users size={12} color="#38bdf8" />
+            <Text style={styles.employeeBadgeText}>{employees.length} Enrolled</Text>
+          </View>
         </View>
 
         <View
@@ -521,13 +551,20 @@ export default function AttendanceScreen() {
             styles.matchCard,
             activeMatch ? styles.cardMatch : styles.cardWaiting,
           ]}>
-          <Text style={styles.matchTitle}>
-            {activeMatch
-              ? `IDENTIFIED: ${activeMatch.name.toUpperCase()}`
-              : employees.length === 0
-              ? 'NO ENROLLED EMPLOYEES LOCALLY'
-              : 'SEARCHING LOCAL DATABASE...'}
-          </Text>
+          <View style={styles.matchTitleRow}>
+            {activeMatch ? (
+              <UserCheck size={16} color="#38bdf8" />
+            ) : (
+              <ScanFace size={16} color="#94a3b8" />
+            )}
+            <Text style={styles.matchTitle}>
+              {activeMatch
+                ? `IDENTIFIED: ${activeMatch.name.toUpperCase()}`
+                : employees.length === 0
+                ? 'NO ENROLLED EMPLOYEES LOCALLY'
+                : 'SEARCHING LOCAL DATABASE...'}
+            </Text>
+          </View>
 
           <Text style={styles.similarityText}>
             Match Score: {(liveSimilarity * 100).toFixed(0)}% (Threshold:{' '}
@@ -580,14 +617,19 @@ const styles = StyleSheet.create({
     fontSize: 17,
     fontWeight: '700',
   },
-  employeeBadge: {
-    color: '#38bdf8',
-    fontSize: 12,
-    fontWeight: '600',
+  employeeBadgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
     backgroundColor: 'rgba(56, 189, 248, 0.15)',
     paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 8,
+  },
+  employeeBadgeText: {
+    color: '#38bdf8',
+    fontSize: 12,
+    fontWeight: '600',
   },
   matchCard: {
     padding: 12,
@@ -604,6 +646,11 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(3, 105, 161, 0.35)',
     borderColor: '#38bdf8',
     borderWidth: 1,
+  },
+  matchTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
   matchTitle: {
     color: '#ffffff',

@@ -1,5 +1,6 @@
 import React from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, ActivityIndicator } from 'react-native';
+import { Sparkles, X } from 'lucide-react-native';
 
 /**
  * Reusable Bottom Progress Card for Face Enrollment
@@ -32,9 +33,12 @@ export default function EnrollmentProgressCard({
         </View>
       ) : (
         <>
-          <Text style={styles.progressCount}>
-            Verified Face Samples: {samplesCount} / {targetSamples}
-          </Text>
+          <View style={styles.countRow}>
+            <Sparkles size={14} color="#38bdf8" />
+            <Text style={styles.progressCount}>
+              Verified Face Samples: {samplesCount} / {targetSamples}
+            </Text>
+          </View>
 
           <View style={styles.progressBarTrack}>
             <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} />
@@ -47,7 +51,10 @@ export default function EnrollmentProgressCard({
         onPress={onCancel}
         disabled={isSaving}
         activeOpacity={0.7}>
-        <Text style={styles.cancelBtnText}>Cancel</Text>
+        <View style={styles.cancelContent}>
+          <X size={14} color="#ef4444" />
+          <Text style={styles.cancelBtnText}>Cancel</Text>
+        </View>
       </TouchableOpacity>
     </View>
   );
@@ -77,11 +84,16 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     textAlign: 'center',
   },
+  countRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 8,
+  },
   progressCount: {
     color: '#38bdf8',
     fontSize: 13,
     fontWeight: '600',
-    marginTop: 8,
   },
   progressBarTrack: {
     width: '100%',
@@ -111,6 +123,11 @@ const styles = StyleSheet.create({
     marginTop: 14,
     paddingVertical: 6,
     paddingHorizontal: 16,
+  },
+  cancelContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
   },
   cancelBtnText: {
     color: '#ef4444',

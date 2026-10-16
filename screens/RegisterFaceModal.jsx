@@ -19,6 +19,7 @@ import { FACE_CONFIG } from '../constants/faceConfig';
 import { averageEmbeddings, validateFacePose } from '../utils/faceEmbeddingUtils';
 import FaceGuideBox from '../components/FaceGuideBox';
 import EnrollmentProgressCard from '../components/EnrollmentProgressCard';
+import SimpleLoading from '../components/SimpleLoading';
 
 export default function RegisterFaceModal({
   visible,
@@ -60,6 +61,7 @@ export default function RegisterFaceModal({
   const isCapturingRef = useRef(true);
   const hasValidFaceRef = useRef(false);
   const lastSampleTimeRef = useRef(0);
+  const lastValidFaceTimeRef = useRef(0);
 
   useEffect(() => {
     if (!hasPermission) {
@@ -82,7 +84,11 @@ export default function RegisterFaceModal({
       });
 
       setSamplesCount(0);
-      setDetectionStatus('Position Face in Box');
+      setDetectionStatus(
+        modelPlugin.state === 'loading'
+          ? 'Starting AI Model...'
+          : 'Position Face in Box',
+      );
       setBoxState('DEFAULT');
       setHasValidFace(false);
       setIsSaving(false);
@@ -90,8 +96,9 @@ export default function RegisterFaceModal({
       isCapturingRef.current = true;
       hasValidFaceRef.current = false;
       lastSampleTimeRef.current = 0;
+      lastValidFaceTimeRef.current = 0;
     }
-  }, [visible]);
+  }, [visible, modelPlugin.state]);
 
   // ============================================================
   // SAVE EMBEDDING LOCALLY & TO CLOUD
@@ -161,6 +168,7 @@ export default function RegisterFaceModal({
     }
 
     // Valid single face detected
+    lastValidFaceTimeRef.current = Date.now();
     hasValidFaceRef.current = true;
     setHasValidFace(true);
     setBoxState('ALIGNED');
@@ -171,7 +179,11 @@ export default function RegisterFaceModal({
   // WORKLET RECEIVER & VECTOR AVERAGING
   // ============================================================
   const handleEmbeddingFromWorklet = (rawArr) => {
-    if (!isCapturingRef.current || !hasValidFaceRef.current) return;
+    const isRecentlyValid =
+      hasValidFaceRef.current ||
+      Date.now() - lastValidFaceTimeRef.current < 450;
+
+    if (!isCapturingRef.current || !isRecentlyValid) return;
 
     const now = Date.now();
     if (now - lastSampleTimeRef.current < sampleIntervalMsRef.current) {
@@ -256,13 +268,20 @@ export default function RegisterFaceModal({
             device={device}
             isActive={visible && !isSaving}
             outputs={[frameOutput]}
-            runClassifications={false}
-            runLandmarks={false}
+            runClassifications={true}
+            runLandmarks={true}
             runContours={false}
             trackingEnabled={true}
             performanceMode="fast"
             onFacesDetected={handleFacesDetected}
           />
+        )}
+
+        {/* Loading Indicator for Model Initialization */}
+        {modelPlugin.state === 'loading' && (
+          <View style={styles.loadingBanner}>
+            <SimpleLoading size="small" text="Initializing Face AI Engine..." />
+          </View>
         )}
 
         {/* Reusable Guide Frame Overlay */}
@@ -281,6 +300,16 @@ export default function RegisterFaceModal({
           isSaving={isSaving}
           onCancel={onClose}
         />
+
+        {/* Saving Face Template Overlay */}
+        {isSaving && (
+          <SimpleLoading
+            overlay
+            size="medium"
+            text="Saving Face Template..."
+            subtext="Averaging 128D facial vectors & saving to local biometric vault"
+          />
+        )}
       </View>
     </Modal>
   );
@@ -290,5 +319,25 @@ const styles = StyleSheet.create({
   modalContainer: {
     flex: 1,
     backgroundColor: '#000000',
+  },
+  loadingBanner: {
+    position: 'absolute',
+    top: 50,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(15, 23, 42, 0.92)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#38bdf8',
+    zIndex: 20,
+  },
+  loadingText: {
+    color: '#38bdf8',
+    fontSize: 13,
+    fontWeight: '600',
   },
 });

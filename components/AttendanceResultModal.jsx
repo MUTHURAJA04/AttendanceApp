@@ -1,5 +1,6 @@
 import React from 'react';
 import { StyleSheet, View, Text } from 'react-native';
+import { AlertTriangle, CheckCircle2, LogOut, Check } from 'lucide-react-native';
 
 /**
  * Reusable modal popup for punch success (IN/OUT) with PRESENT status badge and duplicate lockout notification
@@ -11,7 +12,9 @@ export default function AttendanceResultModal({ punchSuccess, duplicateWarning }
   if (duplicateWarning) {
     return (
       <View style={styles.duplicateModal}>
-        <Text style={styles.duplicateIcon}>⚠️</Text>
+        <View style={styles.iconCircleWarning}>
+          <AlertTriangle size={36} color="#ffffff" strokeWidth={2.2} />
+        </View>
         <Text style={styles.duplicateTitle}>
           Already Punched {duplicateWarning.lastType}!
         </Text>
@@ -30,7 +33,8 @@ export default function AttendanceResultModal({ punchSuccess, duplicateWarning }
         {/* Badges Row: PRESENT status + Action Type */}
         <View style={styles.badgeRow}>
           <View style={styles.presentBadge}>
-            <Text style={styles.presentBadgeText}>✓ PRESENT</Text>
+            <Check size={12} color="#15803d" strokeWidth={3} />
+            <Text style={styles.presentBadgeText}>PRESENT</Text>
           </View>
           <View style={styles.typeBadge}>
             <Text style={styles.typeBadgeText}>
@@ -39,7 +43,14 @@ export default function AttendanceResultModal({ punchSuccess, duplicateWarning }
           </View>
         </View>
 
-        <Text style={styles.successIcon}>{isOut ? '👋' : '✓'}</Text>
+        <View style={styles.iconCircleSuccess}>
+          {isOut ? (
+            <LogOut size={40} color="#ffffff" strokeWidth={2.2} />
+          ) : (
+            <CheckCircle2 size={44} color="#ffffff" strokeWidth={2.2} />
+          )}
+        </View>
+
         <Text style={styles.successTitle}>
           {isOut ? 'Attendance Verified' : 'Attendance Marked'}
         </Text>
@@ -91,9 +102,12 @@ const styles = StyleSheet.create({
   },
   presentBadge: {
     backgroundColor: '#ffffff',
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
   },
   presentBadgeText: {
     color: '#15803d',
@@ -113,10 +127,23 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 1,
   },
-  successIcon: {
-    color: '#ffffff',
-    fontSize: 40,
-    fontWeight: 'bold',
+  iconCircleSuccess: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    backgroundColor: 'rgba(255, 255, 255, 0.20)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 8,
+  },
+  iconCircleWarning: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: 'rgba(255, 255, 255, 0.20)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
   },
   successTitle: {
     color: '#ffffff',
@@ -159,9 +186,6 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.45,
     shadowRadius: 10,
     zIndex: 100,
-  },
-  duplicateIcon: {
-    fontSize: 38,
   },
   duplicateTitle: {
     color: '#ffffff',

@@ -6,15 +6,23 @@ import {
   FlatList,
 } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
+import { ClipboardList, LogIn, LogOut, Check } from 'lucide-react-native';
 import { EmployeeStorage } from '../services/employeeStorage';
+import SimpleLoading from '../components/SimpleLoading';
 
 export default function HistoryScreen() {
   const isFocused = useIsFocused();
   const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
 
   const loadLogs = async () => {
-    const data = await EmployeeStorage.getAttendanceLogs();
-    setLogs(data);
+    try {
+      setLoading(true);
+      const data = await EmployeeStorage.getAttendanceLogs();
+      setLogs(data);
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -57,8 +65,17 @@ export default function HistoryScreen() {
       </View>
 
       {/* Log Entries */}
-      {logs.length === 0 ? (
+      {loading && logs.length === 0 ? (
         <View style={styles.emptyContainer}>
+          <SimpleLoading
+            text="Loading Punch History"
+            subtext="Fetching biometric logs from local storage..."
+            size="medium"
+          />
+        </View>
+      ) : logs.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <ClipboardList size={44} color="#475569" style={{ marginBottom: 12 }} />
           <Text style={styles.emptyTitle}>No punches recorded</Text>
           <Text style={styles.emptySub}>
             Successful face verifications from the Kiosk will appear here in real time.
@@ -95,6 +112,7 @@ export default function HistoryScreen() {
                       {item.employeeName || 'Staff Member'}
                     </Text>
                     <View style={styles.presentPill}>
+                      <Check size={11} color="#38bdf8" strokeWidth={3} />
                       <Text style={styles.presentPillText}>PRESENT</Text>
                     </View>
                     <View
@@ -102,6 +120,11 @@ export default function HistoryScreen() {
                         styles.typeBadge,
                         isCheckIn ? styles.badgeIn : styles.badgeOut,
                       ]}>
+                      {isCheckIn ? (
+                        <LogIn size={11} color="#22c55e" strokeWidth={2.5} />
+                      ) : (
+                        <LogOut size={11} color="#f59e0b" strokeWidth={2.5} />
+                      )}
                       <Text style={styles.badgeText}>{isCheckIn ? 'IN' : 'OUT'}</Text>
                     </View>
                   </View>
@@ -142,9 +165,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     padding: 30,
   },
+  loadingTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginTop: 14,
+  },
   emptyTitle: { color: '#ffffff', fontSize: 16, fontWeight: '600' },
   emptySub: {
-    color: '#64748b',
+    color: '#94a3b8',
     fontSize: 13,
     textAlign: 'center',
     marginTop: 6,
@@ -182,7 +211,10 @@ const styles = StyleSheet.create({
   dateText: { color: '#64748b', fontSize: 11, marginTop: 2 },
   scoreText: { color: '#22c55e', fontSize: 11, marginTop: 2, fontWeight: '600' },
   typeBadge: {
-    paddingHorizontal: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    paddingHorizontal: 7,
     paddingVertical: 2,
     borderRadius: 6,
   },
@@ -198,20 +230,23 @@ const styles = StyleSheet.create({
   },
   badgeText: {
     color: '#ffffff',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '800',
     letterSpacing: 0.5,
   },
   presentPill: {
-    backgroundColor: 'rgba(34, 197, 94, 0.18)',
-    borderColor: '#22c55e',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    backgroundColor: 'rgba(56, 189, 248, 0.15)',
+    borderColor: '#38bdf8',
     borderWidth: 1,
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: 6,
   },
   presentPillText: {
-    color: '#4ade80',
+    color: '#38bdf8',
     fontSize: 10,
     fontWeight: '800',
     letterSpacing: 0.5,

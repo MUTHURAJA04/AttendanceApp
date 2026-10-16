@@ -5,14 +5,15 @@ import {
   View,
   FlatList,
   TextInput,
-  ActivityIndicator,
   RefreshControl,
   Alert,
 } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
+import { Search, Users, UserX } from 'lucide-react-native';
 import { EmployeeStorage } from '../services/employeeStorage';
 import RegisterFaceModal from './RegisterFaceModal';
 import EmployeeItemCard from '../components/EmployeeItemCard';
+import SimpleLoading from '../components/SimpleLoading';
 
 export default function EmployeesScreen() {
   const isFocused = useIsFocused();
@@ -82,16 +83,20 @@ export default function EmployeesScreen() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Staff Directory</Text>
-          <Text style={styles.subtitle}>
-            {loading
-              ? 'Loading profiles...'
-              : `${enrolledCount} / ${employees.length} Faces Enrolled Locally`}
-          </Text>
+          <View style={styles.subtitleRow}>
+            <Users size={13} color="#38bdf8" />
+            <Text style={styles.subtitle}>
+              {loading
+                ? 'Syncing staff database...'
+                : `${enrolledCount} / ${employees.length} Faces Enrolled Locally`}
+            </Text>
+          </View>
         </View>
       </View>
 
-      {/* Search Bar */}
+      {/* Search Bar with Search Icon */}
       <View style={styles.searchContainer}>
+        <Search size={18} color="#64748b" style={styles.searchIcon} />
         <TextInput
           style={styles.searchInput}
           placeholder="Search by name, code or department..."
@@ -105,11 +110,15 @@ export default function EmployeesScreen() {
       {/* Employee List */}
       {loading && employees.length === 0 ? (
         <View style={styles.emptyContainer}>
-          <ActivityIndicator size="large" color="#38bdf8" />
-          <Text style={styles.emptySub}>Loading staff records...</Text>
+          <SimpleLoading
+            text="Loading Staff Directory"
+            subtext="Fetching profiles & local face vectors..."
+            size="medium"
+          />
         </View>
       ) : filteredEmployees.length === 0 ? (
         <View style={styles.emptyContainer}>
+          <UserX size={44} color="#475569" style={{ marginBottom: 12 }} />
           <Text style={styles.emptyTitle}>
             {search ? 'No matching employee found' : 'No staff registered'}
           </Text>
@@ -180,21 +189,34 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontWeight: '700',
   },
+  subtitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 4,
+  },
   subtitle: {
     color: '#38bdf8',
     fontSize: 13,
-    marginTop: 4,
     fontWeight: '600',
   },
   searchContainer: {
     paddingHorizontal: 16,
     paddingTop: 14,
+    position: 'relative',
+  },
+  searchIcon: {
+    position: 'absolute',
+    left: 28,
+    top: 25,
+    zIndex: 1,
   },
   searchInput: {
     backgroundColor: '#1e293b',
     color: '#ffffff',
     borderRadius: 10,
-    paddingHorizontal: 14,
+    paddingLeft: 38,
+    paddingRight: 14,
     paddingVertical: 10,
     fontSize: 14,
     borderWidth: 1,
@@ -206,13 +228,19 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 20,
   },
+  loadingTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginTop: 14,
+  },
   emptyTitle: {
     color: '#ffffff',
     fontSize: 16,
     fontWeight: '600',
   },
   emptySub: {
-    color: '#64748b',
+    color: '#94a3b8',
     fontSize: 13,
     textAlign: 'center',
     marginTop: 6,

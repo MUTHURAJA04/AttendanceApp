@@ -10,12 +10,21 @@ import {
   Platform,
 } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
+import {
+  RefreshCw,
+  Users,
+  ShieldCheck,
+  Cpu,
+  CheckCircle2,
+  XCircle,
+} from 'lucide-react-native';
 import { EmployeeStorage } from '../services/employeeStorage';
 import {
   loadKioskSettings,
   subscribeToLiveSettings,
 } from '../services/kioskSettings';
 import { FACE_CONFIG } from '../constants/faceConfig';
+import SimpleLoading from '../components/SimpleLoading';
 
 export default function SettingsScreen() {
   const isFocused = useIsFocused();
@@ -118,7 +127,8 @@ export default function SettingsScreen() {
   const thresholdPercent = (similarityScoreVal * 100).toFixed(0);
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
+    <View style={styles.container}>
+      <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.title}>System Settings</Text>
@@ -127,7 +137,10 @@ export default function SettingsScreen() {
 
       <View style={styles.content}>
         {/* 1. EMPLOYEE DATA SYNC CARD */}
-        <Text style={styles.sectionHeader}>STAFF PROFILES SYNCHRONIZATION</Text>
+        <View style={styles.sectionHeaderRow}>
+          <Users size={16} color="#38bdf8" />
+          <Text style={styles.sectionHeader}>STAFF PROFILES SYNCHRONIZATION</Text>
+        </View>
         <View style={styles.card}>
           <View style={styles.syncRow}>
             <View style={styles.syncInfo}>
@@ -143,22 +156,36 @@ export default function SettingsScreen() {
               disabled={isSyncing}
               activeOpacity={0.75}>
               {isSyncing ? (
-                <ActivityIndicator size="small" color="#ffffff" />
+                <View style={styles.syncBtnContent}>
+                  <ActivityIndicator size="small" color="#ffffff" />
+                  <Text style={styles.syncBtnText}>Syncing...</Text>
+                </View>
               ) : (
-                <Text style={styles.syncBtnText}>🔄 Sync Employees</Text>
+                <View style={styles.syncBtnContent}>
+                  <RefreshCw size={15} color="#ffffff" />
+                  <Text style={styles.syncBtnText}>Sync Employees</Text>
+                </View>
               )}
             </TouchableOpacity>
           </View>
         </View>
 
         {/* 2. RECOGNITION ENGINE (Dynamic Live Dashboard Settings) */}
-        <Text style={styles.sectionHeader}>DASHBOARD BIOMETRIC AI CONTROLS</Text>
+        <View style={styles.sectionHeaderRow}>
+          <ShieldCheck size={16} color="#38bdf8" />
+          <Text style={styles.sectionHeader}>DASHBOARD BIOMETRIC AI CONTROLS</Text>
+        </View>
         <View style={styles.card}>
           <View style={styles.infoRow}>
             <Text style={styles.infoLabel}>Anti-Spoofing (Liveness Engine)</Text>
             <View style={isLivenessActive ? styles.badgeActive : styles.badgeDisabled}>
+              {isLivenessActive ? (
+                <CheckCircle2 size={12} color="#4ade80" />
+              ) : (
+                <XCircle size={12} color="#94a3b8" />
+              )}
               <Text style={isLivenessActive ? styles.badgeActiveText : styles.badgeDisabledText}>
-                {isLivenessActive ? '● Active (Blink Required)' : '○ Disabled'}
+                {isLivenessActive ? 'Active (Blink Required)' : 'Disabled'}
               </Text>
             </View>
           </View>
@@ -200,7 +227,10 @@ export default function SettingsScreen() {
         </View>
 
         {/* 3. TERMINAL & SYSTEM DIAGNOSTICS */}
-        <Text style={styles.sectionHeader}>TERMINAL DIAGNOSTICS</Text>
+        <View style={styles.sectionHeaderRow}>
+          <Cpu size={16} color="#38bdf8" />
+          <Text style={styles.sectionHeader}>TERMINAL DIAGNOSTICS</Text>
+        </View>
         <View style={styles.card}>
           <View style={styles.infoRow}>
             <Text style={styles.infoLabel}>Terminal Mode</Text>
@@ -245,6 +275,16 @@ export default function SettingsScreen() {
         </View>
       </View>
     </ScrollView>
+
+    {isSyncing && (
+      <SimpleLoading
+        overlay
+        size="large"
+        text="Syncing Staff & Face Embeddings..."
+        subtext="Fetching latest employee profiles and 128D biometric vectors from cloud"
+      />
+    )}
+  </View>
   );
 }
 
@@ -252,6 +292,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0f172a',
+  },
+  scrollView: {
+    flex: 1,
   },
   scrollContent: {
     paddingBottom: 40,
@@ -276,14 +319,19 @@ const styles = StyleSheet.create({
   content: {
     padding: 16,
   },
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 18,
+    marginBottom: 8,
+    marginLeft: 4,
+  },
   sectionHeader: {
-    color: '#64748b',
+    color: '#94a3b8',
     fontSize: 12,
     fontWeight: '700',
     letterSpacing: 1,
-    marginTop: 14,
-    marginBottom: 8,
-    marginLeft: 4,
   },
   card: {
     backgroundColor: '#1e293b',
@@ -315,15 +363,19 @@ const styles = StyleSheet.create({
   },
   syncBtn: {
     backgroundColor: '#2563eb',
-    paddingHorizontal: 16,
+    paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
-    minWidth: 110,
   },
   syncBtnDisabled: {
     opacity: 0.6,
+  },
+  syncBtnContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
   syncBtnText: {
     color: '#ffffff',
@@ -348,6 +400,9 @@ const styles = StyleSheet.create({
     marginLeft: 8,
   },
   badgeActive: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
     backgroundColor: 'rgba(34, 197, 94, 0.15)',
     borderColor: '#22c55e',
     borderWidth: 1,
@@ -361,6 +416,9 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   badgeDisabled: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
     backgroundColor: 'rgba(100, 116, 139, 0.2)',
     borderColor: '#64748b',
     borderWidth: 1,
