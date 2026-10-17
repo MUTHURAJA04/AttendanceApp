@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './supabase';
 import { FACE_CONFIG } from '../constants/faceConfig';
+import { checkForDuplicateFace } from '../utils/faceEmbeddingUtils';
 
 const EMPLOYEES_KEY = '@attendance_employees';
 const ATTENDANCE_LOGS_KEY = '@attendance_logs';
@@ -121,7 +122,7 @@ export const EmployeeStorage = {
    * @param {Array<number>} params.template - 512-D vector
    * @returns {Promise<object>}
    */
-  async saveEmployeeFaceCloudAndLocal({ employee, template }) {
+  async saveEmployeeFaceCloudAndLocal({ employee, template, skipDuplicateCheck = false }) {
     if (!employee || !employee.id) {
       throw new Error('Missing employee profile for face enrollment');
     }
@@ -131,6 +132,24 @@ export const EmployeeStorage = {
 
     const templateArray = Array.from(template);
     const nowIso = new Date().toISOString();
+
+    // Prevent duplicate biometric enrollment across different employees
+    if (!skipDuplicateCheck) {
+      const allEmployees = await this.getAllEmployees();
+      const duplicate = checkForDuplicateFace(templateArray, allEmployees, employee.id);
+      if (duplicate.isDuplicate) {
+        const existingName = duplicate.existingEmployee.name || duplicate.existingEmployee.full_name || 'Existing Staff';
+        const existingCode = duplicate.existingEmployee.code || duplicate.existingEmployee.employee_code || '';
+        const matchPct = (duplicate.similarity * 100).toFixed(1);
+        const err = new Error(
+          `This face is already enrolled for ${existingName}${existingCode ? ` (${existingCode})` : ''} with ${matchPct}% match. The same person cannot be enrolled under multiple employee profiles.`,
+        );
+        err.code = 'DUPLICATE_FACE';
+        err.existingEmployee = duplicate.existingEmployee;
+        err.similarity = duplicate.similarity;
+        throw err;
+      }
+    }
 
     const employeeToSave = {
       ...employee,

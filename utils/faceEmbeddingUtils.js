@@ -214,3 +214,65 @@ export function validateFacePose(faces, optionsOrYaw = FACE_CONFIG.MAX_HEAD_YAW_
 
   return { isValid: true, status: 'VALID_FACE', message: 'Face Detected', face };
 }
+
+/**
+ * Verifies whether a face embedding matches another existing employee in the database.
+ * Used during Face Enrollment & Update to prevent the same physical person from enrolling
+ * or updating under multiple employee profiles.
+ *
+ * @param {Float32Array | number[]} newEmbedding - Newly captured 512-D face embedding
+ * @param {Array<object>} allEmployees - Full list of employees
+ * @param {string | number} currentEmployeeId - ID of employee currently being enrolled/updated
+ * @param {number} [duplicateThreshold] - Similarity threshold to consider as duplicate (default 0.75)
+ * @returns {{ isDuplicate: boolean, existingEmployee: object | null, similarity: number }}
+ */
+export function checkForDuplicateFace(
+  newEmbedding,
+  allEmployees,
+  currentEmployeeId,
+  duplicateThreshold = FACE_CONFIG.DUPLICATE_FACE_THRESHOLD || 0.75,
+) {
+  if (!newEmbedding || !Array.isArray(allEmployees) || allEmployees.length === 0) {
+    return { isDuplicate: false, existingEmployee: null, similarity: 0 };
+  }
+
+  const vecLen = newEmbedding.length;
+  let highestDuplicateScore = -1;
+  let duplicateEmployee = null;
+  let overallMaxScore = -1;
+
+  for (let i = 0; i < allEmployees.length; i++) {
+    const emp = allEmployees[i];
+
+    // Exclude the current employee (self-update is allowed)
+    if (String(emp.id) === String(currentEmployeeId)) {
+      continue;
+    }
+
+    const template = emp.template || emp.face_embedding;
+    if (!template || template.length < vecLen) {
+      continue;
+    }
+
+    let dot = 0;
+    for (let j = 0; j < vecLen; j++) {
+      dot += newEmbedding[j] * template[j];
+    }
+
+    if (dot > overallMaxScore) {
+      overallMaxScore = dot;
+    }
+
+    if (dot >= duplicateThreshold && dot > highestDuplicateScore) {
+      highestDuplicateScore = dot;
+      duplicateEmployee = emp;
+    }
+  }
+
+  return {
+    isDuplicate: duplicateEmployee !== null,
+    existingEmployee: duplicateEmployee,
+    similarity: duplicateEmployee !== null ? highestDuplicateScore : Math.max(0, overallMaxScore),
+  };
+}
+

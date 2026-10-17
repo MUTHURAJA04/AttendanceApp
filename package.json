@@ -8,7 +8,7 @@
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
-    "postinstall": "node scripts/patchTts.js"
+    "postinstall": "node scripts/patchTts.js && node scripts/patchTflite.js"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "^3.1.1",

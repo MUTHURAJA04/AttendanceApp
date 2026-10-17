@@ -21,6 +21,7 @@ export const FACE_CONFIG = {
   // Enrollment settings
   ENROLLMENT_SAMPLE_TARGET: 10,
   SAMPLE_INTERVAL_MS: 200,
+  DUPLICATE_FACE_THRESHOLD: 0.75,
 
   // Liveness (Blink) thresholds & Pose Gates
   EYE_CLOSED_THRESHOLD: 0.25,

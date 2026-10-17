@@ -42,6 +42,14 @@ export default function AttendanceScreen() {
     [model],
   );
 
+  useEffect(() => {
+    if (modelPlugin.state === 'error') {
+      console.error('[Attendance] TFLite model failed to load:', modelPlugin.error);
+    } else if (modelPlugin.state === 'loaded') {
+      console.log('[Attendance] TFLite model loaded successfully.');
+    }
+  }, [modelPlugin.state, modelPlugin.error]);
+
   const { resizer } = useResizer({
     width: FACE_CONFIG.MODEL_INPUT_WIDTH,
     height: FACE_CONFIG.MODEL_INPUT_HEIGHT,
@@ -296,14 +304,21 @@ export default function AttendanceScreen() {
     employeePunchStateRef.current.set(String(employee.id), punch.type);
 
     let spokenText = '';
-    const formattedTime = ttsService.formatCurrentTime();
 
     if (punch.type === 'IN') {
-      // --- CASE B: Check-IN ---
-      spokenText = ttsService.speakCheckIn(employee.name, formattedTime);
+      // --- CASE B: Check-IN (Tamil Voice Announcement) ---
+      spokenText = ttsService.speakCheckIn(employee.name, punch.timestamp);
     } else {
-      // --- CASE C: Check-OUT ---
-      spokenText = ttsService.speakCheckOut(employee.name);
+      // --- CASE C: Check-OUT (Tamil Voice Announcement with Work Duration) ---
+      const punchInTimestamp =
+        lastPunch && String(lastPunch.type).toUpperCase() === 'IN'
+          ? lastPunch.timestamp
+          : null;
+      spokenText = ttsService.speakCheckOut(
+        employee.name,
+        punch.timestamp,
+        punchInTimestamp,
+      );
     }
 
     // Audio & Haptic confirmation

@@ -109,6 +109,9 @@ android {
         checkReleaseBuilds false
         abortOnError false
     }
+    aaptOptions {
+        noCompress "tflite"
+    }
 }
 
 dependencies {

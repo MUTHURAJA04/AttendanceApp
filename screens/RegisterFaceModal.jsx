@@ -18,7 +18,11 @@ import { scheduleOnRN } from 'react-native-worklets';
 import { EmployeeStorage } from '../services/employeeStorage';
 import { loadKioskSettings } from '../services/kioskSettings';
 import { FACE_CONFIG } from '../constants/faceConfig';
-import { averageEmbeddings, validateFacePose } from '../utils/faceEmbeddingUtils';
+import {
+  averageEmbeddings,
+  validateFacePose,
+  checkForDuplicateFace,
+} from '../utils/faceEmbeddingUtils';
 import FaceGuideBox from '../components/FaceGuideBox';
 import EnrollmentProgressCard from '../components/EnrollmentProgressCard';
 import SimpleLoading from '../components/SimpleLoading';
@@ -41,6 +45,14 @@ export default function RegisterFaceModal({
     () => (model != null ? NitroModules.box(model) : null),
     [model],
   );
+
+  useEffect(() => {
+    if (modelPlugin.state === 'error') {
+      console.error('[RegisterFace] TFLite model failed to load:', modelPlugin.error);
+    } else if (modelPlugin.state === 'loaded') {
+      console.log('[RegisterFace] TFLite model loaded successfully.');
+    }
+  }, [modelPlugin.state, modelPlugin.error]);
 
   const { resizer } = useResizer({
     width: FACE_CONFIG.MODEL_INPUT_WIDTH,
@@ -119,6 +131,49 @@ export default function RegisterFaceModal({
 
     try {
       setIsSaving(true);
+      setDetectionStatus('Verifying Unique Identity...');
+
+      // 1. Prevent duplicate biometric enrollment across different employees
+      const allEmployees = await EmployeeStorage.getAllEmployees();
+      const duplicateResult = checkForDuplicateFace(
+        templateVector,
+        allEmployees,
+        employee.id,
+      );
+
+      if (duplicateResult.isDuplicate) {
+        const existing = duplicateResult.existingEmployee;
+        const matchPercent = (duplicateResult.similarity * 100).toFixed(1);
+        const existingName = existing.name || existing.full_name || 'Existing Staff';
+        const existingCode = existing.code || existing.employee_code ? ` (${existing.code || existing.employee_code})` : '';
+
+        console.warn(
+          `[RegisterFaceModal] Duplicate face detected! Matches ${existingName} (${matchPercent}%)`,
+        );
+
+        setBoxState('WARNING');
+        setDetectionStatus('Duplicate Face Detected!');
+
+        Alert.alert(
+          'Duplicate Face Detected ⚠️',
+          `This face is already registered for:\n\n${existingName}${existingCode}\nMatch confidence: ${matchPercent}%\n\nThe same person cannot be enrolled or updated under multiple employee accounts.`,
+          [
+            {
+              text: 'OK',
+              onPress: () => {
+                isCapturingRef.current = true;
+                samplesRef.current = [];
+                setSamplesCount(0);
+                setIsSaving(false);
+                setBoxState('DEFAULT');
+                setDetectionStatus('Position Face in Box');
+              },
+            },
+          ],
+        );
+        return;
+      }
+
       console.log(`[RegisterFaceModal] Saving 512-D face embedding for ${employee.name || employee.full_name}...`);
 
       // Saves locally to AsyncStorage AND syncs to Supabase employees.face_embedding
