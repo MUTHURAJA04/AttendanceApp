@@ -64,21 +64,23 @@ export default function FaceGuideBox({
         </View>
       </View>
 
-      {/* Centered Guide Box Overlay at Exact Screen Center */}
-      <View
-        style={[
-          styles.guideBox,
-          getBoxBorderStyle(),
-          {
-            top: boxTop,
-            left: boxLeft,
-            width: boxSize,
-            height: boxSize,
-          },
-        ]}
-        pointerEvents="none">
-        {subText ? <Text style={styles.subText}>{subText}</Text> : null}
-      </View>
+      {/* Centered Guide Box Overlay at Exact Screen Center (hidden when punch is verified) */}
+      {boxState !== 'MATCH' && (
+        <View
+          style={[
+            styles.guideBox,
+            getBoxBorderStyle(),
+            {
+              top: boxTop,
+              left: boxLeft,
+              width: boxSize,
+              height: boxSize,
+            },
+          ]}
+          pointerEvents="none">
+          {subText ? <Text style={styles.subText}>{subText}</Text> : null}
+        </View>
+      )}
     </>
   );
 }

@@ -251,10 +251,10 @@ export const EmployeeStorage = {
    * @param {number} params.similarityScore
    * @param {string} [params.department]
    * @param {string} [params.branchId]
-   * @param {number} [params.cooldownMinutes]
-   * @returns {Promise<{ status: string, waitSeconds?: number, lastType?: string, punch?: object }>}
+   * @param {string} [params.forcedType]
+   * @returns {Promise<{ status: string, waitSeconds?: number, elapsedMinutes?: number, lastType?: string, lastPunch?: object, punch?: object }>}
    */
-  async logAttendancePunch({ employeeId, employeeName, similarityScore, department, branchId, cooldownMinutes }) {
+  async logAttendancePunch({ employeeId, employeeName, similarityScore, department, branchId, cooldownMinutes, forcedType }) {
     try {
       const logs = await this.getAttendanceLogs();
       const now = new Date();
@@ -278,18 +278,21 @@ export const EmployeeStorage = {
 
         if (diffMs < cooldownMs) {
           const waitSeconds = Math.ceil((cooldownMs - diffMs) / 1000);
+          const elapsedMinutes = Math.max(1, Math.round(diffMs / (60 * 1000)));
           return {
             status: 'DUPLICATE_BLOCKED',
             waitSeconds,
+            elapsedMinutes,
             lastType: lastPunch.type || 'IN',
+            lastPunch,
             employeeName,
           };
         }
       }
 
       // --- 2. STRICT IN -> OUT -> IN ALTERNATING LOGIC ---
-      let punchType = 'IN';
-      if (todayPunches.length > 0) {
+      let punchType = forcedType || 'IN';
+      if (!forcedType && todayPunches.length > 0) {
         const lastType = String(todayPunches[0].type || '').toUpperCase();
         punchType = lastType === 'IN' ? 'OUT' : 'IN';
       }

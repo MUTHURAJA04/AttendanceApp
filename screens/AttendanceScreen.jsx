@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { StyleSheet, Text, View, Vibration } from 'react-native';
+import { StyleSheet, View, Vibration } from 'react-native';
 import {
   useCameraDevice,
   useCameraPermission,
@@ -12,7 +12,7 @@ import { NitroModules } from 'react-native-nitro-modules';
 import { scheduleOnRN } from 'react-native-worklets';
 import { useIsFocused } from '@react-navigation/native';
 import Sound from 'react-native-sound';
-import { Users, UserCheck, ScanFace, Camera as CameraIcon } from 'lucide-react-native';
+import { Camera as CameraIcon } from 'lucide-react-native';
 
 import { EmployeeStorage } from '../services/employeeStorage';
 import {
@@ -23,8 +23,8 @@ import {
 import { FACE_CONFIG } from '../constants/faceConfig';
 import { findBestFaceMatch, validateFacePose } from '../utils/faceEmbeddingUtils';
 import FaceGuideBox from '../components/FaceGuideBox';
-import AttendanceResultModal from '../components/AttendanceResultModal';
 import SimpleLoading from '../components/SimpleLoading';
+import ttsService from '../services/ttsService';
 
 export default function AttendanceScreen() {
   const isFocused = useIsFocused();
@@ -52,20 +52,16 @@ export default function AttendanceScreen() {
   });
 
   // State
-  const [employees, setEmployees] = useState([]);
   const [activeMatch, setActiveMatch] = useState(null);
-  const [liveSimilarity, setLiveSimilarity] = useState(0);
   const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'IDENTIFIED' | 'MATCH' | 'WARNING'
   const [promptText, setPromptText] = useState('Position Face in Box');
-  const [punchSuccess, setPunchSuccess] = useState(null);
-  const [duplicateWarning, setDuplicateWarning] = useState(null);
-  const [threshold, setThreshold] = useState(FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD);
 
   // Synchronization refs for callbacks and worklets
   const employeesRef = useRef([]);
   const activeMatchRef = useRef(null);
   const liveSimilarityRef = useRef(0);
   const isCooldownRef = useRef(false);
+  const isLockedRef = useRef(false);
   const thresholdRef = useRef(FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD);
   const livenessEnabledRef = useRef(true);
   const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES);
@@ -84,7 +80,7 @@ export default function AttendanceScreen() {
 
   const chimeSoundRef = useRef(null);
 
-  // Setup sound effect
+  // Setup sound effect & TTS lifecycle
   useEffect(() => {
     const chime = new Sound('alert.mp3', Sound.MAIN_BUNDLE, (error) => {
       if (error) {
@@ -99,6 +95,7 @@ export default function AttendanceScreen() {
       if (chimeSoundRef.current) {
         chimeSoundRef.current.release();
       }
+      ttsService.stopTts();
     };
   }, []);
 
@@ -136,7 +133,6 @@ export default function AttendanceScreen() {
     // 1. Fast load from local storage
     const localList = await EmployeeStorage.getAllEmployees();
     const enrolledOnly = localList.filter((e) => e.hasFace && e.template);
-    setEmployees(enrolledOnly);
     employeesRef.current = enrolledOnly;
 
     // 2. Refresh today's punch state map for all employees
@@ -146,7 +142,6 @@ export default function AttendanceScreen() {
     EmployeeStorage.syncEmployeesFromCloud()
       .then(async (updatedList) => {
         const updatedEnrolled = updatedList.filter((e) => e.hasFace && e.template);
-        setEmployees(updatedEnrolled);
         employeesRef.current = updatedEnrolled;
         await refreshTodayPunchStates();
       })
@@ -162,7 +157,6 @@ export default function AttendanceScreen() {
     const cooldown = Number(cfg.doublePunchLockout ?? FACE_CONFIG.PUNCH_COOLDOWN_MINUTES);
     const sessionVer = Number(cfg.sessionVersion ?? 1);
 
-    setThreshold(thresh);
     thresholdRef.current = thresh;
     livenessEnabledRef.current = liveness;
     yawAngleToleranceRef.current = yaw;
@@ -202,14 +196,12 @@ export default function AttendanceScreen() {
 
   const resetKiosk = () => {
     isCooldownRef.current = false;
+    isLockedRef.current = false;
     setActiveMatch(null);
     activeMatchRef.current = null;
-    setLiveSimilarity(0);
     liveSimilarityRef.current = 0;
     setBoxState('DEFAULT');
     setPromptText('Position Face in Box');
-    setPunchSuccess(null);
-    setDuplicateWarning(null);
     consecutiveMatchRef.current = { id: null, count: 0 };
     lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
     eyesWereClosed.current = false;
@@ -222,7 +214,7 @@ export default function AttendanceScreen() {
   // ATTENDANCE PUNCH EXECUTION (Local DB + Cloud + UI Lockout)
   // ============================================================
   const triggerAttendancePunch = async (employee, score) => {
-    if (isCooldownRef.current) return;
+    if (isCooldownRef.current || isLockedRef.current) return;
 
     // Strict 2-frame consensus gate: 2 consecutive frames within 400ms with similarity >= live threshold
     const candidate = lastCandidateRef.current;
@@ -241,38 +233,81 @@ export default function AttendanceScreen() {
     }
 
     isCooldownRef.current = true;
+    isLockedRef.current = true;
 
-    // 1. Record punch in storage (evaluates duplicate lockout & alternates strictly IN -> OUT -> IN)
+    // 1. Query the last recorded punch for that employee for today
+    const lastPunch = await EmployeeStorage.getLatestPunchToday(employee.id);
+    const activeCooldownMins = cooldownMinutesRef.current || FACE_CONFIG.PUNCH_COOLDOWN_MINUTES || 2;
+    const cooldownMs = activeCooldownMins * 60 * 1000;
+
+    let isDuplicate = false;
+    let elapsedMinutes = 1;
+
+    if (lastPunch) {
+      const lastPunchTime = new Date(lastPunch.timestamp).getTime();
+      const diffMs = now - lastPunchTime;
+      if (diffMs < cooldownMs) {
+        isDuplicate = true;
+        elapsedMinutes = Math.max(1, Math.round(diffMs / (60 * 1000)));
+      }
+    }
+
+    // --- CASE A: Duplicate / Accidental Linger (< cooldown elapsed) ---
+    if (isDuplicate) {
+      const lastType = lastPunch?.type || 'IN';
+      const spokenText = ttsService.speakDuplicateWarning(employee.name, elapsedMinutes, lastType);
+
+      Vibration.vibrate(350);
+      setBoxState('WARNING');
+      setPromptText(spokenText);
+
+      console.warn(`[Attendance] Duplicate punch debounced for ${employee.name} (${lastType} ${elapsedMinutes}m ago)`);
+
+      // 3.5-second lockout so employee can walk away without re-triggering
+      setTimeout(() => {
+        resetKiosk();
+      }, 3500);
+      return;
+    }
+
+    // Determine alternating punch status:
+    // If employee has no punch today, or last was OUT -> Check-IN
+    // If last was IN and cooldown has elapsed -> Check-OUT
+    const isCheckIn = !lastPunch || String(lastPunch.type).toUpperCase() === 'OUT';
+    const punchType = isCheckIn ? 'IN' : 'OUT';
+
+    // Record new punch record with current timestamp
     const result = await EmployeeStorage.logAttendancePunch({
       employeeId: employee.id,
       employeeName: employee.name,
       department: employee.department,
       branchId: employee.branch_id || employee.branchId,
-      cooldownMinutes: cooldownMinutesRef.current,
+      cooldownMinutes: activeCooldownMins,
       similarityScore: score,
+      forcedType: punchType,
     });
 
-    // --- CASE A: DUPLICATE PUNCH (< 2 minutes) ---
-    if (result.status === 'DUPLICATE_BLOCKED') {
-      Vibration.vibrate(350);
-      setBoxState('WARNING');
-      setPromptText(`Already Punched ${result.lastType}!`);
+    const punch = result?.punch || {
+      type: punchType,
+      timestamp: new Date().toISOString(),
+    };
 
-      setDuplicateWarning({
-        name: result.employeeName,
-        lastType: result.lastType,
-        waitSeconds: result.waitSeconds,
-      });
+    // Update in-memory punch status for this employee
+    employeePunchStateRef.current.set(String(employee.id), punch.type);
 
-      setTimeout(() => {
-        resetKiosk();
-      }, FACE_CONFIG.PUNCH_DUPLICATE_LOCKOUT_MS);
-      return;
+    let spokenText = '';
+    const formattedTime = ttsService.formatCurrentTime();
+
+    if (punch.type === 'IN') {
+      // --- CASE B: Check-IN ---
+      spokenText = ttsService.speakCheckIn(employee.name, formattedTime);
+    } else {
+      // --- CASE C: Check-OUT ---
+      spokenText = ttsService.speakCheckOut(employee.name);
     }
 
-    // --- CASE B: SUCCESSFUL VERIFICATION & PUNCH (IN / OUT) ---
+    // Audio & Haptic confirmation
     Vibration.vibrate([0, 70, 50, 70]);
-
     if (chimeSoundRef.current) {
       chimeSoundRef.current.stop(() => {
         chimeSoundRef.current.play((success) => {
@@ -281,33 +316,16 @@ export default function AttendanceScreen() {
       });
     }
 
-    const punch = result.punch;
-    
-    // Update in-memory punch status for this employee
-    employeePunchStateRef.current.set(String(employee.id), punch.type);
-
+    // Synchronize UI on-screen pill text with exact TTS utterance
     setBoxState('MATCH');
-    setPromptText(`${employee.name}: PRESENT (Checked ${punch.type})!`);
+    setPromptText(spokenText);
 
-    setPunchSuccess({
-      name: employee.name,
-      id: employee.id,
-      department: employee.department || 'Staff',
-      type: punch.type,
-      time: new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      }),
-      score: (score * 100).toFixed(0),
-    });
+    console.log(`[Attendance] ✓ Verified: ${employee.name} | Type: ${punch.type} | Score: ${(score * 100).toFixed(1)}% | TTS: "${spokenText}"`);
 
-    console.log(`[Attendance] ✓ Verified: ${employee.name} | Type: ${punch.type} | Score: ${(score * 100).toFixed(1)}%`);
-
-    // Lockout period before returning to search mode
+    // 3.5-second lockout period before resetting back to scanning mode
     setTimeout(() => {
       resetKiosk();
-    }, FACE_CONFIG.PUNCH_SUCCESS_LOCKOUT_MS);
+    }, 3500);
   };
 
   triggerPunchRef.current = triggerAttendancePunch;
@@ -317,7 +335,7 @@ export default function AttendanceScreen() {
   // ============================================================
   const handleFacesDetected = useCallback(
     (faces) => {
-      if (isCooldownRef.current || !isFocused) return;
+      if (isCooldownRef.current || isLockedRef.current || !isFocused) return;
 
       const validation = validateFacePose(faces, {
         maxYaw: yawAngleToleranceRef.current || FACE_CONFIG.MAX_HEAD_YAW_DEGREES,
@@ -431,14 +449,13 @@ export default function AttendanceScreen() {
   // PHASE 2: CONTINUOUS 1:N RECOGNITION (MobileFaceNet 512-D Embedding)
   // ============================================================
   const handleEmbeddingFromWorklet = (embeddingArray) => {
-    if (isCooldownRef.current || !isFocused) return;
+    if (isCooldownRef.current || isLockedRef.current || !isFocused) return;
 
     const currentList = employeesRef.current;
     if (!currentList || currentList.length === 0) {
       setActiveMatch(null);
       activeMatchRef.current = null;
       lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
-      setLiveSimilarity(0);
       liveSimilarityRef.current = 0;
       return;
     }
@@ -454,7 +471,6 @@ export default function AttendanceScreen() {
     );
 
     liveSimilarityRef.current = similarityScore;
-    setLiveSimilarity(similarityScore);
 
     const now = Date.now();
 
@@ -600,49 +616,6 @@ export default function AttendanceScreen() {
         subText="Keep face steady inside frame"
         isIdentified={Boolean(activeMatch)}
       />
-
-      {/* Reusable Attendance Verification Modal (IN / OUT / Duplicate) */}
-      <AttendanceResultModal
-        punchSuccess={punchSuccess}
-        duplicateWarning={duplicateWarning}
-      />
-
-      {/* Bottom Live Metrics & Enrolled Database Status */}
-      <View style={styles.overlay}>
-        <View style={styles.headerRow}>
-          <Text style={styles.title}>Attendance Kiosk</Text>
-          <View style={styles.employeeBadgeRow}>
-            <Users size={12} color="#38bdf8" />
-            <Text style={styles.employeeBadgeText}>{employees.length} Enrolled</Text>
-          </View>
-        </View>
-
-        <View
-          style={[
-            styles.matchCard,
-            activeMatch ? styles.cardMatch : styles.cardWaiting,
-          ]}>
-          <View style={styles.matchTitleRow}>
-            {activeMatch ? (
-              <UserCheck size={16} color="#38bdf8" />
-            ) : (
-              <ScanFace size={16} color="#94a3b8" />
-            )}
-            <Text style={styles.matchTitle}>
-              {activeMatch
-                ? `IDENTIFIED: ${activeMatch.name.toUpperCase()}`
-                : employees.length === 0
-                ? 'NO ENROLLED EMPLOYEES LOCALLY'
-                : 'SEARCHING LOCAL DATABASE...'}
-            </Text>
-          </View>
-
-          <Text style={styles.similarityText}>
-            Match Score: {(liveSimilarity * 100).toFixed(0)}% (Threshold:{' '}
-            {(threshold * 100).toFixed(0)}%)
-          </Text>
-        </View>
-      </View>
     </View>
   );
 }
@@ -661,76 +634,5 @@ const styles = StyleSheet.create({
   text: {
     color: '#ffffff',
     fontSize: 16,
-  },
-  overlay: {
-    position: 'absolute',
-    left: 18,
-    right: 18,
-    bottom: 22,
-    padding: 16,
-    borderRadius: 16,
-    backgroundColor: 'rgba(15, 23, 42, 0.95)',
-    borderWidth: 1,
-    borderColor: '#334155',
-    elevation: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.35,
-    shadowRadius: 5,
-  },
-  headerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  title: {
-    color: '#ffffff',
-    fontSize: 17,
-    fontWeight: '700',
-  },
-  employeeBadgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    backgroundColor: 'rgba(56, 189, 248, 0.15)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 8,
-  },
-  employeeBadgeText: {
-    color: '#38bdf8',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  matchCard: {
-    padding: 12,
-    borderRadius: 10,
-    marginTop: 10,
-    alignItems: 'center',
-  },
-  cardWaiting: {
-    backgroundColor: 'rgba(51, 65, 85, 0.4)',
-    borderColor: '#475569',
-    borderWidth: 1,
-  },
-  cardMatch: {
-    backgroundColor: 'rgba(3, 105, 161, 0.35)',
-    borderColor: '#38bdf8',
-    borderWidth: 1,
-  },
-  matchTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  matchTitle: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  similarityText: {
-    color: '#94a3b8',
-    fontSize: 12,
-    marginTop: 4,
   },
 });
