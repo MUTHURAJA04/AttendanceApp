@@ -2,6 +2,8 @@ import { NativeModules, Platform } from 'react-native';
 import Tts from 'react-native-tts';
 
 let isTtsReady = false;
+let lastSpokenText = '';
+let lastSpokenTime = 0;
 
 /**
  * Check if the native TextToSpeech module is linked in the running native binary
@@ -231,6 +233,15 @@ export const calculateWorkDuration = (punchInTimestamp, punchOutTimestamp = new 
  */
 export const speakText = (text) => {
   if (!text) return text;
+
+  // Prevent rapid duplicate spam: ignore identical utterances within 8 seconds
+  const now = Date.now();
+  if (text === lastSpokenText && now - lastSpokenTime < 8000) {
+    return text;
+  }
+  lastSpokenText = text;
+  lastSpokenTime = now;
+
   if (!isTtsAvailable()) {
     console.warn('[TTS] Cannot speak: Native TextToSpeech module not loaded in running binary.');
     return text;
@@ -257,6 +268,8 @@ export const speakText = (text) => {
  * Stop any ongoing TTS speech immediately
  */
 export const stopTts = () => {
+  lastSpokenText = '';
+  lastSpokenTime = 0;
   if (!isTtsAvailable()) return;
   try {
     Tts.stop();

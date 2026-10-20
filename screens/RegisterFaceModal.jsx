@@ -32,6 +32,7 @@ export default function RegisterFaceModal({
   employee,
   onClose,
   onEnrolled,
+  type = 'enroll',
 }) {
   const device = useCameraDevice('front');
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -65,16 +66,21 @@ export default function RegisterFaceModal({
 
   const [samplesCount, setSamplesCount] = useState(0);
   const [targetSamples, setTargetSamples] = useState(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET || 10);
-  const [detectionStatus, setDetectionStatus] = useState('Position Face in Box');
+  const [detectionStatus, setDetectionStatus] = useState('Align your face inside the frame');
   const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'WARNING' | 'MATCH'
   const [hasValidFace, setHasValidFace] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [liveFaceBounds, setLiveFaceBounds] = useState(null);
+  const [multipleFaces, setMultipleFaces] = useState(false);
 
   // Dynamic configuration refs from DB
   const targetSamplesRef = useRef(FACE_CONFIG.ENROLLMENT_SAMPLE_TARGET || 10);
   const sampleIntervalMsRef = useRef(FACE_CONFIG.SAMPLE_INTERVAL_MS || 200);
   const yawAngleToleranceRef = useRef(FACE_CONFIG.MAX_HEAD_YAW_DEGREES || 18);
 
+  const lastFaceCenterRef = useRef({ x: 0, y: 0 });
+  const steadyStartRef = useRef(0);
+  const isSteadyRef = useRef(false);
   const samplesRef = useRef([]);
   const isCapturingRef = useRef(true);
   const hasValidFaceRef = useRef(false);
@@ -106,11 +112,16 @@ export default function RegisterFaceModal({
       setDetectionStatus(
         modelPlugin.state === 'loading'
           ? 'Starting AI Model...'
-          : 'Position Face in Box',
+          : 'Align your face inside the frame',
       );
       setBoxState('DEFAULT');
       setHasValidFace(false);
       setIsSaving(false);
+      setLiveFaceBounds(null);
+      setMultipleFaces(false);
+      lastFaceCenterRef.current = { x: 0, y: 0 };
+      steadyStartRef.current = 0;
+      isSteadyRef.current = false;
       samplesRef.current = [];
       isCapturingRef.current = true;
       hasValidFaceRef.current = false;
@@ -139,6 +150,7 @@ export default function RegisterFaceModal({
         templateVector,
         allEmployees,
         employee.id,
+        employee.code || employee.employee_code,
       );
 
       if (duplicateResult.isDuplicate) {
@@ -180,13 +192,15 @@ export default function RegisterFaceModal({
       await EmployeeStorage.saveEmployeeFaceCloudAndLocal({
         employee,
         template: templateVector,
+        skipDuplicateCheck: true,
       });
 
       setBoxState('MATCH');
-      setDetectionStatus('Face Enrolled & Saved Locally!');
+      const isUpdate = type === 'update' || Boolean(employee?.hasFace);
+      setDetectionStatus(isUpdate ? 'Face Template Updated!' : 'Face Enrolled & Saved Locally!');
 
       Alert.alert(
-        'Enrollment Complete! ✓',
+        isUpdate ? 'Face Updated Successfully! ✓' : 'Enrollment Complete! ✓',
         `512-D face template saved locally on device and synced for ${employee.name || employee.full_name || 'employee'}.`,
         [
           {
@@ -216,8 +230,23 @@ export default function RegisterFaceModal({
     if (!isCapturingRef.current) {
       hasValidFaceRef.current = false;
       setHasValidFace(false);
+      isSteadyRef.current = false;
       return;
     }
+
+    // 1. Multi-face check
+    if (faces && faces.length > 1) {
+      setMultipleFaces(true);
+      setLiveFaceBounds(null);
+      isSteadyRef.current = false;
+      steadyStartRef.current = 0;
+      hasValidFaceRef.current = false;
+      setHasValidFace(false);
+      setBoxState('WARNING');
+      setDetectionStatus('Please ensure only one person is in front of the camera');
+      return;
+    }
+    setMultipleFaces(false);
 
     // Strict pose gates: yaw <= 18, pitch <= 14, roll <= 10, minBoxSize >= 120
     const validation = validateFacePose(faces, {
@@ -230,17 +259,43 @@ export default function RegisterFaceModal({
     if (!validation.isValid) {
       hasValidFaceRef.current = false;
       setHasValidFace(false);
+      setLiveFaceBounds(null);
+      isSteadyRef.current = false;
+      steadyStartRef.current = 0;
       setBoxState(validation.status === 'NO_FACE' ? 'DEFAULT' : 'WARNING');
-      setDetectionStatus(validation.message);
+      setDetectionStatus(validation.status === 'NO_FACE' ? 'Align your face inside the frame' : validation.message);
       return;
     }
 
+    const face = validation.face;
+    setLiveFaceBounds(face.bounds || null);
+
+    // Steady face tracking gate
+    const now = Date.now();
+    const faceBounds = face.bounds || {};
+    const centerX = (faceBounds.x || 0) + (faceBounds.width || 0) / 2;
+    const centerY = (faceBounds.y || 0) + (faceBounds.height || 0) / 2;
+    const prev = lastFaceCenterRef.current;
+    const displacement = Math.hypot(centerX - prev.x, centerY - prev.y);
+
+    if (displacement < 40) {
+      if (steadyStartRef.current === 0) {
+        steadyStartRef.current = now;
+      } else if (now - steadyStartRef.current >= 250) {
+        isSteadyRef.current = true;
+      }
+    } else {
+      steadyStartRef.current = now;
+      isSteadyRef.current = false;
+    }
+    lastFaceCenterRef.current = { x: centerX, y: centerY };
+
     // Valid frontal single face detected
-    lastValidFaceTimeRef.current = Date.now();
+    lastValidFaceTimeRef.current = now;
     hasValidFaceRef.current = true;
     setHasValidFace(true);
     setBoxState('ALIGNED');
-    setDetectionStatus('Face Aligned - Hold Steady...');
+    setDetectionStatus(isSteadyRef.current ? 'Hold still...' : 'Face Aligned - Hold Steady...');
   }, []);
 
   // ============================================================
@@ -343,7 +398,7 @@ export default function RegisterFaceModal({
             isActive={visible && !isSaving}
             outputs={[frameOutput]}
             runClassifications={true}
-            runLandmarks={true}
+            runLandmarks={false}
             runContours={false}
             trackingEnabled={true}
             performanceMode="fast"
@@ -361,9 +416,11 @@ export default function RegisterFaceModal({
               ? 'Saving Face Template...'
               : detectionStatus
           }
-          subText={`Look straight into camera to capture ${targetSamples} verified angles`}
           isIdentified={hasValidFace}
           isLoading={modelPlugin.state === 'loading'}
+          faceBounds={liveFaceBounds}
+          showReticle={true}
+          multipleFacesDetected={multipleFaces}
         />
 
         {/* Reusable Bottom Progress Card */}

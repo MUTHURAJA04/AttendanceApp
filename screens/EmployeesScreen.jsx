@@ -157,14 +157,23 @@ export default function EmployeesScreen() {
         <RegisterFaceModal
           visible={showRegisterModal}
           employee={selectedEmployee}
+          type={selectedEmployee?.hasFace ? 'update' : 'enroll'}
           onClose={() => {
             setSelectedEmployee(null);
             setShowRegisterModal(false);
           }}
-          onEnrolled={() => {
+          onEnrolled={async () => {
             setSelectedEmployee(null);
             setShowRegisterModal(false);
-            loadEmployeesData(false); // Reload to update face badges
+            const localData = await EmployeeStorage.getAllEmployees();
+            if (localData && localData.length > 0) {
+              setEmployees(localData);
+            }
+            EmployeeStorage.syncEmployeesFromCloud()
+              .then((synced) => {
+                if (synced && synced.length > 0) setEmployees(synced);
+              })
+              .catch(() => {});
           }}
         />
       )}

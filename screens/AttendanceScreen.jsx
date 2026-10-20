@@ -62,9 +62,20 @@ export default function AttendanceScreen() {
   // State
   const [activeMatch, setActiveMatch] = useState(null);
   const [boxState, setBoxState] = useState('DEFAULT'); // 'DEFAULT' | 'ALIGNED' | 'IDENTIFIED' | 'MATCH' | 'WARNING'
-  const [promptText, setPromptText] = useState('Position Face in Box');
+  const boxStateRef = useRef('DEFAULT');
+  const [promptText, setPromptText] = useState('Align your face inside the frame');
+  const [liveFaceBounds, setLiveFaceBounds] = useState(null);
+  const [multipleFaces, setMultipleFaces] = useState(false);
+
+  const updateBoxState = useCallback((val) => {
+    boxStateRef.current = val;
+    setBoxState(val);
+  }, []);
 
   // Synchronization refs for callbacks and worklets
+  const lastFaceCenterRef = useRef({ x: 0, y: 0 });
+  const steadyStartRef = useRef(0);
+  const isSteadyRef = useRef(false);
   const employeesRef = useRef([]);
   const activeMatchRef = useRef(null);
   const liveSimilarityRef = useRef(0);
@@ -79,6 +90,10 @@ export default function AttendanceScreen() {
   const lastCandidateRef = useRef({ id: null, timestamp: 0, count: 0, match: null, score: 0 });
   const triggerPunchRef = useRef(null);
   const employeePunchStateRef = useRef(new Map()); // Map of employeeId -> 'IN' | 'OUT'
+  const lastValidFaceTimeRef = useRef(0);
+  const lastPunchedEmployeeIdRef = useRef(null);
+  const noFaceFramesCountRef = useRef(0);
+  const lastDuplicateWarnTimeRef = useRef(new Map()); // Map of employeeId -> timestamp
 
   // Blink state machine refs
   const eyesWereClosed = useRef(false);
@@ -172,6 +187,30 @@ export default function AttendanceScreen() {
     sessionVersionRef.current = sessionVer;
   }, []);
 
+  const resetKiosk = useCallback((clearLastPunched = true) => {
+    if (clearLastPunched) {
+      lastPunchedEmployeeIdRef.current = null;
+    }
+    noFaceFramesCountRef.current = 0;
+    isCooldownRef.current = false;
+    isLockedRef.current = false;
+    setActiveMatch(null);
+    activeMatchRef.current = null;
+    liveSimilarityRef.current = 0;
+    updateBoxState('DEFAULT');
+    setPromptText('Align your face inside the frame');
+    setLiveFaceBounds(null);
+    setMultipleFaces(false);
+    steadyStartRef.current = 0;
+    isSteadyRef.current = false;
+    consecutiveMatchRef.current = { id: null, count: 0 };
+    lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
+    eyesWereClosed.current = false;
+    closedFrameCount.current = 0;
+    openFrameCount.current = 0;
+    blinkCooldown.current = false;
+  }, [updateBoxState]);
+
   // Reload employee profiles & live DB config when screen gains focus, plus real-time listeners
   useEffect(() => {
     if (!isFocused) return;
@@ -200,29 +239,20 @@ export default function AttendanceScreen() {
       if (liveSettingsSub?.unsubscribe) liveSettingsSub.unsubscribe();
       if (remoteLogoutSub?.unsubscribe) remoteLogoutSub.unsubscribe();
     };
-  }, [isFocused, loadEmployeeProfiles, applyKioskSettings]);
-
-  const resetKiosk = () => {
-    isCooldownRef.current = false;
-    isLockedRef.current = false;
-    setActiveMatch(null);
-    activeMatchRef.current = null;
-    liveSimilarityRef.current = 0;
-    setBoxState('DEFAULT');
-    setPromptText('Position Face in Box');
-    consecutiveMatchRef.current = { id: null, count: 0 };
-    lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
-    eyesWereClosed.current = false;
-    closedFrameCount.current = 0;
-    openFrameCount.current = 0;
-    blinkCooldown.current = false;
-  };
+  }, [isFocused, loadEmployeeProfiles, applyKioskSettings, resetKiosk]);
 
   // ============================================================
   // ATTENDANCE PUNCH EXECUTION (Local DB + Cloud + UI Lockout)
   // ============================================================
   const triggerAttendancePunch = async (employee, score) => {
+    // If locked, in cooldown, or this exact employee already punched/debounced and is still lingering in front of kiosk
     if (isCooldownRef.current || isLockedRef.current) return;
+    if (
+      lastPunchedEmployeeIdRef.current &&
+      String(lastPunchedEmployeeIdRef.current) === String(employee.id)
+    ) {
+      return;
+    }
 
     // Strict 2-frame consensus gate: 2 consecutive frames within 400ms with similarity >= live threshold
     const candidate = lastCandidateRef.current;
@@ -240,8 +270,10 @@ export default function AttendanceScreen() {
       return;
     }
 
+    // Immediately lock and clear candidate to prevent subsequent frames from re-triggering
     isCooldownRef.current = true;
     isLockedRef.current = true;
+    lastCandidateRef.current = { id: null, timestamp: 0, count: 0, match: null, score: 0 };
 
     // 1. Query the last recorded punch for that employee for today
     const lastPunch = await EmployeeStorage.getLatestPunchToday(employee.id);
@@ -262,21 +294,38 @@ export default function AttendanceScreen() {
 
     // --- CASE A: Duplicate / Accidental Linger (< cooldown elapsed) ---
     if (isDuplicate) {
-      const lastType = lastPunch?.type || 'IN';
-      const spokenText = ttsService.speakDuplicateWarning(employee.name, elapsedMinutes, lastType);
+      // Mark as handled so lingering in front of kiosk produces ZERO further checks or audio
+      lastPunchedEmployeeIdRef.current = String(employee.id);
 
-      Vibration.vibrate(350);
-      setBoxState('WARNING');
+      const lastType = lastPunch?.type || 'IN';
+      const lastWarnTime = lastDuplicateWarnTimeRef.current.get(String(employee.id)) || 0;
+      const shouldSpeak = (now - lastWarnTime) > 20000; // Speak duplicate warning at most once per 20 seconds
+
+      let spokenText = '';
+      if (shouldSpeak) {
+        spokenText = ttsService.speakDuplicateWarning(employee.name, elapsedMinutes, lastType);
+        lastDuplicateWarnTimeRef.current.set(String(employee.id), now);
+        Vibration.vibrate(350);
+      } else {
+        const action = String(lastType).toUpperCase() === 'OUT' ? 'புறப்பாடு' : 'வருகை';
+        spokenText = `ஏற்கனவே ${elapsedMinutes} நிமிடம் முன் ${action} பதிவு செய்யப்பட்டது. தயவுசெய்து காத்திருக்கவும்.`;
+      }
+
+      updateBoxState('WARNING');
       setPromptText(spokenText);
 
       console.warn(`[Attendance] Duplicate punch debounced for ${employee.name} (${lastType} ${elapsedMinutes}m ago)`);
 
-      // 3.5-second lockout so employee can walk away without re-triggering
+      // Release internal lock after 3.5s so next employee can scan, but keep lingering employee protected until they walk away
       setTimeout(() => {
-        resetKiosk();
+        isCooldownRef.current = false;
+        isLockedRef.current = false;
       }, 3500);
       return;
     }
+
+    // Mark as punched immediately so lingering in front of kiosk produces ZERO duplicate warnings
+    lastPunchedEmployeeIdRef.current = String(employee.id);
 
     // Determine alternating punch status:
     // If employee has no punch today, or last was OUT -> Check-IN
@@ -332,15 +381,17 @@ export default function AttendanceScreen() {
     }
 
     // Synchronize UI on-screen pill text with exact TTS utterance
-    setBoxState('MATCH');
+    updateBoxState('MATCH');
     setPromptText(spokenText);
 
     console.log(`[Attendance] ✓ Verified: ${employee.name} | Type: ${punch.type} | Score: ${(score * 100).toFixed(1)}% | TTS: "${spokenText}"`);
 
-    // 3.5-second lockout period before resetting back to scanning mode
+    // Lockout scanner for 4 seconds, then release lock so subsequent employees in queue can scan,
+    // while lastPunchedEmployeeIdRef keeps protecting this lingering employee until they walk away.
     setTimeout(() => {
-      resetKiosk();
-    }, 3500);
+      isCooldownRef.current = false;
+      isLockedRef.current = false;
+    }, 4000);
   };
 
   triggerPunchRef.current = triggerAttendancePunch;
@@ -350,7 +401,39 @@ export default function AttendanceScreen() {
   // ============================================================
   const handleFacesDetected = useCallback(
     (faces) => {
-      if (isCooldownRef.current || isLockedRef.current || !isFocused) return;
+      if (!isFocused) return;
+
+      // Walk-away detection: count consecutive frames with no face
+      if (!faces || faces.length === 0) {
+        noFaceFramesCountRef.current += 1;
+        // If no face has been seen for ~1.2 seconds (>= 15 frames)
+        if (noFaceFramesCountRef.current >= 15) {
+          if (lastPunchedEmployeeIdRef.current !== null || boxStateRef.current !== 'DEFAULT') {
+            resetKiosk(true);
+          }
+        }
+        return;
+      }
+
+      // Reset empty frame counter when any face is detected
+      noFaceFramesCountRef.current = 0;
+
+      // 1. Multi-face check
+      if (faces && faces.length > 1) {
+        setMultipleFaces(true);
+        setLiveFaceBounds(null);
+        isSteadyRef.current = false;
+        steadyStartRef.current = 0;
+        updateBoxState('WARNING');
+        setPromptText('Please ensure only one person is in front of the camera');
+        setActiveMatch(null);
+        activeMatchRef.current = null;
+        eyesWereClosed.current = false;
+        closedFrameCount.current = 0;
+        openFrameCount.current = 0;
+        return;
+      }
+      setMultipleFaces(false);
 
       const validation = validateFacePose(faces, {
         maxYaw: yawAngleToleranceRef.current || FACE_CONFIG.MAX_HEAD_YAW_DEGREES,
@@ -360,21 +443,66 @@ export default function AttendanceScreen() {
       });
 
       if (!validation.isValid) {
-        setBoxState(validation.status === 'NO_FACE' ? 'DEFAULT' : 'WARNING');
-        setPromptText(validation.message);
-        setActiveMatch(null);
-        activeMatchRef.current = null;
+        const now = Date.now();
+        if (now - lastValidFaceTimeRef.current > 1500) {
+          // If face turned away or walked out for > 1.5 seconds, reset lingering punch lock
+          if (lastPunchedEmployeeIdRef.current !== null) {
+            resetKiosk(true);
+            return;
+          }
+        }
+        if (now - lastValidFaceTimeRef.current > 250 && lastPunchedEmployeeIdRef.current === null) {
+          setLiveFaceBounds(null);
+          isSteadyRef.current = false;
+          steadyStartRef.current = 0;
+          updateBoxState(validation.status === 'NO_FACE' ? 'DEFAULT' : 'WARNING');
+          setPromptText(validation.status === 'NO_FACE' ? 'Align your face inside the frame' : validation.message);
+          setActiveMatch(null);
+          activeMatchRef.current = null;
+        }
         eyesWereClosed.current = false;
         closedFrameCount.current = 0;
         openFrameCount.current = 0;
         return;
       }
 
+      lastValidFaceTimeRef.current = Date.now();
       const face = validation.face;
+      setLiveFaceBounds(face.bounds || null);
+
+      // If this face belongs to the employee who just punched or was duplicate-debounced,
+      // keep tracking the face bounding box [ ] in green, but bypass blink and punch logic.
+      if (lastPunchedEmployeeIdRef.current !== null) {
+        return;
+      }
+
+      // If kiosk is in cooldown or locked for an in-flight operation, stop here
+      if (isCooldownRef.current || isLockedRef.current) return;
+
+      // Steady face tracking gate (>= 300ms)
+      const now = Date.now();
+      const faceBounds = face.bounds || {};
+      const centerX = (faceBounds.x || 0) + (faceBounds.width || 0) / 2;
+      const centerY = (faceBounds.y || 0) + (faceBounds.height || 0) / 2;
+      const prev = lastFaceCenterRef.current;
+      const displacement = Math.hypot(centerX - prev.x, centerY - prev.y);
+
+      if (displacement < 24) {
+        if (steadyStartRef.current === 0) {
+          steadyStartRef.current = now;
+        } else if (now - steadyStartRef.current >= 300) {
+          isSteadyRef.current = true;
+        }
+      } else {
+        steadyStartRef.current = now;
+        isSteadyRef.current = false;
+      }
+      lastFaceCenterRef.current = { x: centerX, y: centerY };
+
       const currentMatchedEmp = activeMatchRef.current;
 
       if (currentMatchedEmp) {
-        setBoxState('IDENTIFIED');
+        updateBoxState('IDENTIFIED');
         
         // Check current punch status to tell user whether they are checking IN or checking OUT
         const currentPunchType = employeePunchStateRef.current.get(String(currentMatchedEmp.id)) || 'OUT';
@@ -386,12 +514,12 @@ export default function AttendanceScreen() {
           setPromptText(`Hi ${currentMatchedEmp.name}! Blink to ${nextAction}`);
         }
       } else if (employeesRef.current.length === 0) {
-        setBoxState('DEFAULT');
+        updateBoxState('DEFAULT');
         setPromptText('No Enrolled Employees Locally');
         return;
       } else {
-        setBoxState('ALIGNED');
-        setPromptText('Scanning Face...');
+        updateBoxState('ALIGNED');
+        setPromptText(isSteadyRef.current ? 'Hold still...' : 'Scanning Face...');
       }
 
       // 4. Natural Blink Liveness Engine
@@ -432,7 +560,6 @@ export default function AttendanceScreen() {
 
           // If face is identified with 2-frame consensus within 400ms when blink completes -> Stamp attendance
           const candidate = lastCandidateRef.current;
-          const now = Date.now();
           const requiredThreshold = thresholdRef.current || FACE_CONFIG.DEFAULT_SIMILARITY_THRESHOLD;
           const hasConsensus =
             candidate.id != null &&
@@ -457,14 +584,14 @@ export default function AttendanceScreen() {
         }
       }
     },
-    [isFocused],
+    [isFocused, resetKiosk, updateBoxState],
   );
 
   // ============================================================
   // PHASE 2: CONTINUOUS 1:N RECOGNITION (MobileFaceNet 512-D Embedding)
   // ============================================================
   const handleEmbeddingFromWorklet = (embeddingArray) => {
-    if (isCooldownRef.current || isLockedRef.current || !isFocused) return;
+    if (!isFocused) return;
 
     const currentList = employeesRef.current;
     if (!currentList || currentList.length === 0) {
@@ -486,6 +613,24 @@ export default function AttendanceScreen() {
     );
 
     liveSimilarityRef.current = similarityScore;
+
+    // Lingering face check:
+    // If the recognized face is the employee who just punched or was duplicate debounced:
+    if (bestMatch && lastPunchedEmployeeIdRef.current !== null) {
+      if (String(bestMatch.id) === String(lastPunchedEmployeeIdRef.current)) {
+        // Same employee lingering in front of kiosk: suppress completely
+        return;
+      } else if (isMatch && similarityScore >= currentThreshold) {
+        // A NEW, different employee (Person B) has stepped up!
+        // Release the lingering lock immediately for Person B!
+        lastPunchedEmployeeIdRef.current = null;
+        isCooldownRef.current = false;
+        isLockedRef.current = false;
+      }
+    }
+
+    // If kiosk is in cooldown or locked for an in-flight operation, stop here
+    if (isCooldownRef.current || isLockedRef.current) return;
 
     const now = Date.now();
 
@@ -619,17 +764,20 @@ export default function AttendanceScreen() {
           isActive={true}
           outputs={[frameOutput]}
           runClassifications={true}
+          runLandmarks={false}
           performanceMode="fast"
           onFacesDetected={handleFacesDetected}
         />
       )}
 
-      {/* Reusable Guide Overlay & Guidance Pill */}
+      {/* Reusable Guide Overlay & Guidance Pill (Plain camera with dynamic brackets [ ]) */}
       <FaceGuideBox
         boxState={boxState}
         promptText={promptText}
-        subText="Keep face steady inside frame"
+        showReticle={true}
+        faceBounds={liveFaceBounds}
         isIdentified={Boolean(activeMatch)}
+        multipleFacesDetected={multipleFaces}
       />
     </View>
   );

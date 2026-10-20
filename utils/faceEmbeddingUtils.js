@@ -230,6 +230,7 @@ export function checkForDuplicateFace(
   newEmbedding,
   allEmployees,
   currentEmployeeId,
+  currentEmployeeCode = null,
   duplicateThreshold = FACE_CONFIG.DUPLICATE_FACE_THRESHOLD || 0.75,
 ) {
   if (!newEmbedding || !Array.isArray(allEmployees) || allEmployees.length === 0) {
@@ -245,7 +246,13 @@ export function checkForDuplicateFace(
     const emp = allEmployees[i];
 
     // Exclude the current employee (self-update is allowed)
-    if (String(emp.id) === String(currentEmployeeId)) {
+    const isSameId = currentEmployeeId != null && String(emp.id) === String(currentEmployeeId);
+    const isSameCode =
+      currentEmployeeCode &&
+      emp.code &&
+      String(emp.code).trim().toLowerCase() === String(currentEmployeeCode).trim().toLowerCase();
+
+    if (isSameId || isSameCode) {
       continue;
     }
 

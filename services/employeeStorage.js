@@ -100,7 +100,11 @@ export const EmployeeStorage = {
         throw new Error('Invalid employee data for local storage');
       }
 
-      const updated = employees.filter(emp => String(emp.id) !== String(formatted.id));
+      const updated = employees.filter(
+        emp =>
+          String(emp.id) !== String(formatted.id) &&
+          (!formatted.code || !emp.code || String(emp.code).trim().toLowerCase() !== String(formatted.code).trim().toLowerCase()),
+      );
       updated.push(formatted);
 
       // Sort alphabetically by name
@@ -136,7 +140,12 @@ export const EmployeeStorage = {
     // Prevent duplicate biometric enrollment across different employees
     if (!skipDuplicateCheck) {
       const allEmployees = await this.getAllEmployees();
-      const duplicate = checkForDuplicateFace(templateArray, allEmployees, employee.id);
+      const duplicate = checkForDuplicateFace(
+        templateArray,
+        allEmployees,
+        employee.id,
+        employee.code || employee.employee_code,
+      );
       if (duplicate.isDuplicate) {
         const existingName = duplicate.existingEmployee.name || duplicate.existingEmployee.full_name || 'Existing Staff';
         const existingCode = duplicate.existingEmployee.code || duplicate.existingEmployee.employee_code || '';
@@ -225,15 +234,20 @@ export const EmployeeStorage = {
         const formattedList = data.map(remoteEmp => {
           const localEmp = localMap.get(String(remoteEmp.id));
           
-          // Use remote embedding if available, otherwise preserve local embedding if local was newer
           let chosenTemplate = remoteEmp.face_embedding;
-          if ((!chosenTemplate || chosenTemplate.length === 0) && localEmp?.template) {
-            chosenTemplate = localEmp.template;
+          // If local has a valid enrolled template, preserve local if it is newer or if cloud has no template
+          if (localEmp?.template && Array.isArray(localEmp.template) && localEmp.template.length >= (FACE_CONFIG.EMBEDDING_SIZE || 512)) {
+            const localTime = new Date(localEmp.face_updated_at || localEmp.updatedAt || 0).getTime();
+            const remoteTime = new Date(remoteEmp.face_updated_at || remoteEmp.updated_at || 0).getTime();
+            if (!chosenTemplate || chosenTemplate.length === 0 || localTime >= remoteTime) {
+              chosenTemplate = localEmp.template;
+            }
           }
 
           return formatEmployeeData({
             ...remoteEmp,
             template: chosenTemplate,
+            face_updated_at: localEmp?.face_updated_at || remoteEmp.face_updated_at,
           });
         });
 
