@@ -468,7 +468,18 @@ export default function AttendanceScreen() {
 
       lastValidFaceTimeRef.current = Date.now();
       const face = validation.face;
-      setLiveFaceBounds(face.bounds || null);
+      setLiveFaceBounds(
+        face?.bounds
+          ? {
+              x: face.bounds.x,
+              y: face.bounds.y,
+              width: face.bounds.width,
+              height: face.bounds.height,
+              frameWidth: face.frameWidth || 0,
+              frameHeight: face.frameHeight || 0,
+            }
+          : null,
+      );
 
       // If this face belongs to the employee who just punched or was duplicate-debounced,
       // keep tracking the face bounding box [ ] in green, but bypass blink and punch logic.

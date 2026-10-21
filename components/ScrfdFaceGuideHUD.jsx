@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useMemo } from 'react';
+import React, { useEffect, useRef, useMemo, useState, useCallback } from 'react';
 import {
   StyleSheet,
   View,
@@ -22,13 +22,29 @@ import { AlertTriangle } from 'lucide-react-native';
 export default function ScrfdFaceGuideHUD({
   boxState = 'DEFAULT', // 'DEFAULT' | 'ALIGNED' | 'IDENTIFIED' | 'MATCH' | 'WARNING'
   promptText = 'Align your face inside the frame',
-  faceBounds = null, // Object with x, y, width, height of detected face
+  faceBounds = null, // Object with x, y, width, height, frameWidth, frameHeight of detected face
   multipleFacesDetected = false,
   isIdentified = false,
   isLoading = false,
   showReticle = true, // Dynamic face tracking corners [ ]
 }) {
-  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const [containerLayout, setContainerLayout] = useState({ width: 0, height: 0 });
+
+  const screenWidth = containerLayout.width > 0 ? containerLayout.width : windowWidth;
+  const screenHeight = containerLayout.height > 0 ? containerLayout.height : windowHeight;
+
+  const onContainerLayout = useCallback((e) => {
+    const { width, height } = e.nativeEvent.layout;
+    if (width > 0 && height > 0) {
+      setContainerLayout((prev) => {
+        if (Math.abs(prev.width - width) < 1 && Math.abs(prev.height - height) < 1) {
+          return prev;
+        }
+        return { width, height };
+      });
+    }
+  }, []);
 
   // Smoothing ref for jitter-free tracking reticle
   const smoothBoxRef = useRef(null);
@@ -55,19 +71,34 @@ export default function ScrfdFaceGuideHUD({
   }, [boxState, matchFlashAnim]);
 
   // Helper: Front-Camera Cover-Scale & Mirrored Coordinate Transform
-  // CameraX portrait buffer is 720x1280 (or 1080x1920)
   const getCameraTransform = useMemo(() => {
-    return (rawX, rawY, rawW = 0, rawH = 0) => {
-      const is1080 = (rawX + rawW > 750) || (rawY + rawH > 1300);
-      const bufferW = is1080 ? 1080 : 720;
-      const bufferH = is1080 ? 1920 : 1280;
+    return (rawX, rawY, rawW = 0, rawH = 0, frameWidth = 0, frameHeight = 0) => {
+      // 1. Determine exact camera buffer dimensions from detector output
+      let bufferW = Number(frameWidth) || 0;
+      let bufferH = Number(frameHeight) || 0;
 
-      // VisionCamera 'cover' scaling: fills screen, keeps aspect ratio
+      // Intelligent fallback if frameWidth/frameHeight is omitted or 0
+      if (bufferW <= 0 || bufferH <= 0) {
+        const maxX = rawX + rawW;
+        const maxY = rawY + rawH;
+        if (maxX > 720 || maxY > 1280) {
+          bufferW = 1080;
+          bufferH = 1920;
+        } else if (maxX > 480 || maxY > 640) {
+          bufferW = 720;
+          bufferH = 1280;
+        } else {
+          bufferW = 480;
+          bufferH = 640;
+        }
+      }
+
+      // 2. VisionCamera 'cover' scaling: fills container view, keeps aspect ratio
       const scale = Math.max(screenWidth / bufferW, screenHeight / bufferH);
       const offsetX = (screenWidth - bufferW * scale) / 2;
       const offsetY = (screenHeight - bufferH * scale) / 2;
 
-      // Front camera preview is mirrored horizontally in React Native
+      // 3. Front camera preview is mirrored horizontally in React Native
       const mirroredX = bufferW - (rawX + rawW);
       const screenX = mirroredX * scale + offsetX;
       const screenY = rawY * scale + offsetY;
@@ -94,13 +125,15 @@ export default function ScrfdFaceGuideHUD({
     const rawY = faceBounds.y ?? faceBounds.originY ?? 0;
     const rawW = faceBounds.width ?? faceBounds.size?.width ?? 0;
     const rawH = faceBounds.height ?? faceBounds.size?.height ?? 0;
+    const frameW = faceBounds.frameWidth ?? 0;
+    const frameH = faceBounds.frameHeight ?? 0;
 
     if (rawW <= 0 || rawH <= 0) {
       smoothBoxRef.current = null;
       return null;
     }
 
-    const target = getCameraTransform(rawX, rawY, rawW, rawH);
+    const target = getCameraTransform(rawX, rawY, rawW, rawH, frameW, frameH);
 
     // Padding around face box for aesthetic biometric reticle
     const padX = target.width * 0.08;
@@ -170,7 +203,7 @@ export default function ScrfdFaceGuideHUD({
   };
 
   return (
-    <>
+    <View style={StyleSheet.absoluteFill} pointerEvents="box-none" onLayout={onContainerLayout}>
       {/* 1. Top Floating Status & Guidance Pill */}
       <View style={styles.pillContainer} pointerEvents="none">
         <View style={[styles.pill, getPillStyle(), styles.pillRow]}>
@@ -222,7 +255,7 @@ export default function ScrfdFaceGuideHUD({
           )}
         </View>
       )}
-    </>
+    </View>
   );
 }
 

@@ -268,7 +268,18 @@ export default function RegisterFaceModal({
     }
 
     const face = validation.face;
-    setLiveFaceBounds(face.bounds || null);
+    setLiveFaceBounds(
+      face?.bounds
+        ? {
+            x: face.bounds.x,
+            y: face.bounds.y,
+            width: face.bounds.width,
+            height: face.bounds.height,
+            frameWidth: face.frameWidth || 0,
+            frameHeight: face.frameHeight || 0,
+          }
+        : null,
+    );
 
     // Steady face tracking gate
     const now = Date.now();
